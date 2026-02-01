@@ -107,36 +107,29 @@ class SniperAnalystLogic:
             else: results.append("away")
         return home_goals, away_goals, results
 
-    # V26 新增：壓力測試 (One-Goal Sensitivity)
+    # V26: 壓力測試 (通用版)
     def check_sensitivity(self, lh, la, pick_type, original_ev):
-        # 模擬變數：假設雙方各多進 0.3 球 (模擬運氣/紅牌/誤判波動)
-        # 1. 主隊運氣好 (+0.3 xG)
-        M_plus_h = self.build_ensemble_matrix(lh + 0.3, la)
-        # 2. 客隊運氣好 (+0.3 xG)
-        M_plus_a = self.build_ensemble_matrix(lh, la + 0.3)
+        # 簡單模擬：如果客隊運氣變好 (+0.3 xG)，這個盤口的優勢還在嗎？
+        M_stress = self.build_ensemble_matrix(lh, la + 0.3)
         
-        # 重新計算 EV (這裡簡化，只針對 1x2 主勝/客勝做示範)
-        # 實際應用需針對具體選項重算，這裡為通用性做一個 "Robustness Score"
-        
+        # 這裡為了效能，我們用一個簡化的 "Robustness Score"
+        # 我們比較 "主勝機率" 在壓力下的跌幅，作為全場波動的指標
         prob_h_orig = float(np.sum(np.tril(self.build_ensemble_matrix(lh, la),-1)))
-        prob_h_new = float(np.sum(np.tril(M_plus_a,-1))) # 客隊變強，主勝機率掉多少
+        prob_h_new = float(np.sum(np.tril(M_stress,-1)))
         
         drop_rate = (prob_h_orig - prob_h_new) / prob_h_orig if prob_h_orig > 0 else 0
         
-        # 如果因為客隊稍微運氣好，主勝機率就暴跌 > 20%，代表盤口脆弱
-        if drop_rate > 0.20:
-            return "High", f"脆弱 (波動跌幅 {drop_rate*100:.1f}%)"
-        elif drop_rate > 0.10:
-            return "Medium", f"普通 (波動跌幅 {drop_rate*100:.1f}%)"
-        else:
-            return "Low", f"堅固 (波動跌幅 {drop_rate*100:.1f}%)"
+        # 根據跌幅給出評級
+        if drop_rate > 0.15: return "High", "脆弱"
+        elif drop_rate > 0.08: return "Medium", "普通"
+        else: return "Low", "堅固"
 
 # =========================
 # 3. Streamlit UI 介面
 # =========================
-st.set_page_config(page_title="狙擊手分析 V26.0 UI", page_icon="⚽", layout="wide")
+st.set_page_config(page_title="狙擊手分析 V26.1 UI", page_icon="⚽", layout="wide")
 
-st.title("⚽ 狙擊手 V26.0 風險控管版")
+st.title("⚽ 狙擊手 V26.1 風險控管版")
 st.markdown("### 專業足球數據分析：EV 拆解 x 壓力測試 x 棄單邏輯")
 
 # --- 側邊欄 ---
@@ -197,47 +190,32 @@ if st.button("🚀 開始全方位分析", type="primary"):
 
         candidates = []
 
-        # --- Tab 1: 價值分析 (V26 升級：EV 拆解) ---
+        # --- Tab 1: 價值分析 (V26.1: 修正顯示問題，套用至所有表格) ---
         with res_tab1:
             st.subheader("💰 獨贏 (1x2) 深度分析")
-            
-            # 準備數據
             rows_1x2 = []
             for tag, prob, key in [("主勝", prob_h, "home"), ("和局", prob_d, "draw"), ("客勝", prob_a, "away")]:
                 odd = engine.market["1x2_odds"][key]
                 total_ev = (prob * odd - 1) * 100 + market_bonus[key]
                 profit = (odd - 1) * unit_stake
                 
-                # V26: EV Source Attribution
+                # EV 拆解
                 implied_prob = 1.0 / odd
-                raw_edge = (prob - implied_prob) * 100 # 模型純優勢
-                leverage = total_ev - raw_edge         # 賠率槓桿 + 市場加成
+                raw_edge = (prob - implied_prob) * 100
+                leverage = total_ev - raw_edge
                 
-                # V26: Sensitivity Check
+                # 壓力測試
                 sens_level, sens_desc = engine.check_sensitivity(lh, la, tag, total_ev)
                 
-                # 標籤邏輯
-                label = ""
-                if total_ev > 3 and sens_level == "Low": label = "💎 價值單"
-                elif total_ev > 10 and sens_level == "High": label = "⚠️ 虛高(脆弱)"
-                elif raw_edge < 0 and total_ev > 0: label = "🧨 僅靠賠率"
-                
                 rows_1x2.append({
-                    "選項": tag,
-                    "賠率": odd,
-                    "模型機率": f"{prob*100:.1f}%",
-                    "總 EV": f"{total_ev:+.1f}%",
-                    "EV 來源 (優勢 | 槓桿)": f"{raw_edge:+.1f}% | {leverage:+.1f}%",
-                    "壓力測試": sens_desc,
-                    "標籤": label
+                    "選項": tag, "賠率": odd, "模型機率": f"{prob*100:.1f}%", "總 EV": f"{total_ev:+.1f}%",
+                    "EV 來源 (優勢|槓桿)": f"{raw_edge:+.1f}% | {leverage:+.1f}%",
+                    "壓力測試": sens_desc, "預計獲利": f"${profit:.1f}"
                 })
-                
-                if total_ev > 1.5:
-                    candidates.append({"type":"1x2", "pick":tag, "ev":total_ev, "odds":odd, "prob":prob, "sens": sens_level})
-            
+                if total_ev > 1.5: candidates.append({"type":"1x2", "pick":tag, "ev":total_ev, "odds":odd, "prob":prob, "sens": sens_level})
             st.dataframe(pd.DataFrame(rows_1x2), use_container_width=True)
 
-            # 亞盤與大小球 (簡化顯示，邏輯同上)
+            # 亞盤 (V26.1 修正：加入 EV 來源與壓力測試)
             c_ah, c_ou = st.columns(2)
             with c_ah:
                 st.subheader("🛡️ 亞盤")
@@ -245,10 +223,26 @@ if st.button("🚀 開始全方位分析", type="primary"):
                 for hcap in engine.market["handicaps"]:
                     ev = engine.ah_ev(M, hcap, engine.market["target_odds"]) + market_bonus["home"]
                     profit = (engine.market["target_odds"]-1)*unit_stake
-                    d_ah.append([f"主 {hcap:+}", f"{ev:+.1f}%", f"${profit:.1f}"])
-                    if ev > 2: candidates.append({"type":"AH", "pick":f"主 {hcap:+}", "ev":ev, "odds":engine.market["target_odds"], "prob":0.5+ev/200, "sens":"Medium"})
-                st.table(pd.DataFrame(d_ah, columns=["盤口", "EV", "獲利"]))
+                    
+                    # 亞盤 EV 拆解 (反推模型勝率)
+                    target_o = engine.market["target_odds"]
+                    implied_p = 1.0 / target_o
+                    # EV = (Prob * Odds - 1) -> Prob = (EV + 1) / Odds (近似值，含 Market Bonus)
+                    model_p_approx = (ev/100.0 + 1) / target_o
+                    raw_edge = (model_p_approx - implied_p) * 100
+                    leverage = ev - raw_edge
+                    
+                    sens_level, sens_desc = engine.check_sensitivity(lh, la, "AH", ev)
+                    
+                    d_ah.append({
+                        "盤口": f"主 {hcap:+}", "EV": f"{ev:+.1f}%", 
+                        "來源 (優|槓)": f"{raw_edge:+.1f}|{leverage:+.1f}",
+                        "壓力": sens_desc, "獲利": f"${profit:.1f}"
+                    })
+                    if ev > 2: candidates.append({"type":"AH", "pick":f"主 {hcap:+}", "ev":ev, "odds":target_o, "prob":model_p_approx, "sens":"Medium"})
+                st.dataframe(pd.DataFrame(d_ah), use_container_width=True)
             
+            # 大小球 (V26.1 修正：加入 EV 來源與壓力測試)
             with c_ou:
                 st.subheader("📐 大小球")
                 d_ou = []
@@ -256,23 +250,33 @@ if st.button("🚀 開始全方位分析", type="primary"):
                     op = sum(M[i,j] for i in range(9) for j in range(9) if i+j>line)
                     ev = (op * engine.market["target_odds"] - 1) * 100
                     profit = (engine.market["target_odds"]-1)*unit_stake
-                    d_ou.append([f"大 {line}", f"{op*100:.1f}%", f"{ev:+.1f}%", f"${profit:.1f}"])
-                    if ev > 2: candidates.append({"type":"OU", "pick":f"大 {line}", "ev":ev, "odds":engine.market["target_odds"], "prob":op, "sens":"Medium"})
-                st.table(pd.DataFrame(d_ou, columns=["盤口", "機率", "EV", "獲利"]))
+                    
+                    target_o = engine.market["target_odds"]
+                    implied_p = 1.0 / target_o
+                    raw_edge = (op - implied_p) * 100
+                    leverage = ev - raw_edge
+                    
+                    sens_level, sens_desc = engine.check_sensitivity(lh, la, "OU", ev)
+                    
+                    d_ou.append({
+                        "盤口": f"大 {line}", "機率": f"{op*100:.1f}%", "EV": f"{ev:+.1f}%",
+                        "來源 (優|槓)": f"{raw_edge:+.1f}|{leverage:+.1f}",
+                        "壓力": sens_desc, "獲利": f"${profit:.1f}"
+                    })
+                    if ev > 2: candidates.append({"type":"OU", "pick":f"大 {line}", "ev":ev, "odds":target_o, "prob":op, "sens":"Medium"})
+                st.dataframe(pd.DataFrame(d_ou), use_container_width=True)
 
-            # 最佳推薦 (含棄單邏輯)
+            # 最佳推薦
             st.subheader("📝 智能投資決策 (Top Picks)")
             if candidates:
                 final = sorted(candidates, key=lambda x:x["ev"], reverse=True)[:3]
-                
-                # V26: No Bet Logic
                 no_bet_flag = False
                 no_bet_reason = []
                 
                 top = final[0]
                 if top['sens'] == "High" and top['ev'] < 15:
                     no_bet_flag = True
-                    no_bet_reason.append("首選注單對運氣波動過於敏感 (Fragile Edge)")
+                    no_bet_reason.append("首選注單對運氣波動過於敏感 (脆弱優勢)")
                 
                 if len(final) >= 2:
                     p1, p2 = final[0], final[1]
@@ -297,7 +301,7 @@ if st.button("🚀 開始全方位分析", type="primary"):
             else:
                 st.info("無適合注單")
 
-        # --- Tab 2, 3, 4 (維持 V25 架構) ---
+        # --- Tab 2, 3, 4 維持不變 ---
         with res_tab2:
             st.subheader("🧠 模型裁決")
             total_xg = lh + la
