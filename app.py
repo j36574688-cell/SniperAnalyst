@@ -3,6 +3,7 @@ import json
 import math
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 
 # =========================
 # 1. 核心數學工具
@@ -99,14 +100,17 @@ class SniperAnalystLogic:
 # =========================
 # 3. Streamlit UI 介面
 # =========================
-st.set_page_config(page_title="狙擊手分析 V24 UI", page_icon="⚽", layout="wide")
+st.set_page_config(page_title="狙擊手分析 V24.1 UI", page_icon="⚽", layout="wide")
 
-st.title("⚽ 狙擊手 V24.0 分析系統")
+st.title("⚽ 狙擊手 V24.1 分析系統")
 st.markdown("### 專業足球數據分析與價值注單計算")
 
 # --- 側邊欄設定 ---
 with st.sidebar:
     st.header("⚙️ 參數設定")
+    # 新增本金設定
+    unit_stake = st.number_input("💰 設定單注本金 ($)", min_value=10, value=100, step=10, help="輸入你的單注金額，系統將自動計算預計獲利")
+    st.divider()
     nb_alpha = st.slider("負二項分佈 Alpha (變異數)", 0.05, 0.20, 0.12, 0.01)
     max_g = st.number_input("最大進球數運算範圍", 5, 15, 9)
     kelly_frac = st.slider("凱利公式比例 (Kelly Fraction)", 0.1, 1.0, 0.4, 0.1)
@@ -203,11 +207,13 @@ if st.button("🚀 開始分析", type="primary"):
             for tag, prob, key in [("主勝", prob_h, "home"), ("和局", prob_d, "draw"), ("客勝", prob_a, "away")]:
                 odd = engine.market["1x2_odds"][key]
                 ev = (prob * odd - 1) * 100 + market_bonus[key]
-                data_1x2.append([tag, f"{prob*100:.1f}%", odd, f"{ev:+.1f}%"])
+                # 計算獲利
+                profit = (odd - 1) * unit_stake
+                data_1x2.append([tag, f"{prob*100:.1f}%", odd, f"{ev:+.1f}%", f"${profit:.1f}"])
                 if ev > 1.5:
                     candidates.append({"type":"1x2", "pick":tag, "ev":ev, "odds":odd, "prob":prob})
             
-            df_1x2 = pd.DataFrame(data_1x2, columns=["選項", "模型機率", "賠率", "EV (期望值)"])
+            df_1x2 = pd.DataFrame(data_1x2, columns=["選項", "模型機率", "賠率", "EV (期望值)", "預計獲利"])
             st.table(df_1x2)
 
             col_ah, col_ou = st.columns(2)
@@ -218,10 +224,14 @@ if st.button("🚀 開始分析", type="primary"):
                 data_ah = []
                 for hcap in engine.market["handicaps"]:
                     ev = engine.ah_ev(M, hcap, engine.market["target_odds"]) + market_bonus["home"]
-                    data_ah.append([f"主 {hcap:+}", f"{ev:+.1f}%"])
+                    # 亞盤獲利 (假設賠率是 target_odds)
+                    h_odd = engine.market["target_odds"]
+                    profit = (h_odd - 1) * unit_stake
+                    
+                    data_ah.append([f"主 {hcap:+}", f"{ev:+.1f}%", f"${profit:.1f}"])
                     if ev > 2:
-                        candidates.append({"type":"AH", "pick":f"主 {hcap:+}", "ev":ev, "odds":engine.market["target_odds"], "prob":0.5+ev/200})
-                st.table(pd.DataFrame(data_ah, columns=["盤口", "EV"]))
+                        candidates.append({"type":"AH", "pick":f"主 {hcap:+}", "ev":ev, "odds":h_odd, "prob":0.5+ev/200})
+                st.table(pd.DataFrame(data_ah, columns=["盤口", "EV", "預計獲利"]))
 
             # 大小球
             with col_ou:
@@ -230,10 +240,14 @@ if st.button("🚀 開始分析", type="primary"):
                 for line in engine.market["goal_lines"]:
                     o_prob = sum(M[i,j] for i in range(9) for j in range(9) if i+j>line)
                     ev_o = (o_prob * engine.market["target_odds"] - 1) * 100
-                    data_ou.append([f"大 {line}", f"{o_prob*100:.1f}%", f"{ev_o:+.1f}%"])
+                    # 大小球獲利
+                    o_odd = engine.market["target_odds"]
+                    profit = (o_odd - 1) * unit_stake
+                    
+                    data_ou.append([f"大 {line}", f"{o_prob*100:.1f}%", f"{ev_o:+.1f}%", f"${profit:.1f}"])
                     if ev_o > 2:
-                        candidates.append({"type":"OU", "pick":f"大 {line}", "ev":ev_o, "odds":engine.market["target_odds"], "prob":o_prob})
-                st.table(pd.DataFrame(data_ou, columns=["盤口", "機率", "EV"]))
+                        candidates.append({"type":"OU", "pick":f"大 {line}", "ev":ev_o, "odds":o_odd, "prob":o_prob})
+                st.table(pd.DataFrame(data_ou, columns=["盤口", "機率", "EV", "預計獲利"]))
 
             # 最終推薦列表
             st.subheader("📝 最佳投資組合 (Top Picks)")
@@ -242,8 +256,12 @@ if st.button("🚀 開始分析", type="primary"):
                 reco_data = []
                 for p in final_list[:3]:
                     kelly = calc_kelly(p["prob"], p["odds"], kelly_frac)
-                    reco_data.append([f"[{p['type']}] {p['pick']}", p['odds'], f"{p['ev']:+.1f}%", f"{kelly:.1f}%"])
-                st.dataframe(pd.DataFrame(reco_data, columns=["選項", "賠率", "EV", "建議注碼%"]), use_container_width=True)
+                    # 計算該選項的預計獲利
+                    profit = (p['odds'] - 1) * unit_stake
+                    reco_data.append([f"[{p['type']}] {p['pick']}", p['odds'], f"{p['ev']:+.1f}%", f"{kelly:.1f}%", f"${profit:.1f}"])
+                
+                st.dataframe(pd.DataFrame(reco_data, columns=["選項", "賠率", "EV", "建議注碼%", "預計獲利 (單注)"]), use_container_width=True)
+                st.caption(f"* 預計獲利是基於您設定的單注本金 ${unit_stake} 計算")
             else:
                 st.info("目前無高 EV 選項推薦。")
 
@@ -308,6 +326,7 @@ if st.button("🚀 開始分析", type="primary"):
                     prob = M[i, j]
                     ev = (prob * odd - 1) * 100
                     if ev > 10:
-                        st.write(f"- **{s}** @ {odd} (機率 {prob*100:.1f}%, EV {ev:+.1f}%)")
+                        profit = (odd - 1) * unit_stake
+                        st.write(f"- **{s}** @ {odd} (機率 {prob*100:.1f}%, EV {ev:+.1f}%) -> 獲利: ${profit:.1f}")
                 except:
                     pass
