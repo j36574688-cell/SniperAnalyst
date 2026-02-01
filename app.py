@@ -37,7 +37,125 @@ def calc_risk_metrics(prob, odds):
     return variance, sharpe
 
 # =========================
-# 2. 分析引擎邏輯
+# 2. 全景記憶體系 (V30 終極擴充版)
+# =========================
+class RegimeMemory:
+    def __init__(self):
+        # 擴充至 20 種經典足球劇本
+        self.history_db = {
+            # --- 🚨 陷阱劇本 (Trap) ---
+            "HeavyFav_DeepBlock":       {"name": "⚠️ 強隊遇鐵桶陣 (攻堅乏力)", "bets": 150, "roi": -0.12},
+            "Derby_HighVol":            {"name": "🧨 火爆德比 (紅牌變數大)", "bets": 45, "roi": -0.08},
+            "DeadRubber":               {"name": "💤 消化試合 (雙方無戰意)", "bets": 80, "roi": -0.05},
+            "MarketHype_Fav":           {"name": "🔥 大熱倒灶 (過度熱門)", "bets": 200, "roi": -0.15},
+            "Fallen_Giant":             {"name": "📉 豪門崩盤 (名氣大狀況差)", "bets": 65, "roi": -0.18}, # 買強隊死很慘
+            "Injury_Crisis_Fav":        {"name": "🏥 傷兵詛咒 (主力缺陣)", "bets": 55, "roi": -0.10},
+            
+            # --- 💰 黃金劇本 (Gold) ---
+            "Title_MustWin_Home":       {"name": "🏆 爭冠必勝盤 (主場)", "bets": 120, "roi": 0.08},
+            "Relegation_Dog":           {"name": "🐕 保級受讓 (絕境爆發)", "bets": 60, "roi": 0.15},
+            "Counter_Away_Dog":         {"name": "⚡ 客隊防反 (偷襲得手)", "bets": 90, "roi": 0.10},
+            "Glass_Shootout":           {"name": "⚽ 互捅局 (大球紅利)", "bets": 110, "roi": 0.12},
+            "Fortress_Home":            {"name": "🏰 魔鬼主場 (主場龍)", "bets": 130, "roi": 0.09},
+            "Hidden_Gem_Dog":           {"name": "🦊 扮豬吃老虎 (數據優於名氣)", "bets": 40, "roi": 0.20},
+            
+            # --- ⚖️ 特殊/中性劇本 (Special) ---
+            "Bore_Draw_Stalemate":      {"name": "🛡️ 雙重鐵桶 (悶和局)", "bets": 75, "roi": 0.05}, # 買小球/和局賺
+            "Volatile_Chaos":           {"name": "🎢 神經刀 (高波動亂戰)", "bets": 85, "roi": -0.02}, # 運氣盤
+            "MidTable_Standard":        {"name": "😐 中游例行公事", "bets": 300, "roi": 0.01},
+            "Late_Season_Collapse":     {"name": "🥀 季末崩盤 (全隊放假)", "bets": 50, "roi": -0.14},
+            "Tactical_Mismatch":        {"name": "⚔️ 風格相剋 (高開低走)", "bets": 30, "roi": 0.04},
+            "Recovery_Mode":            {"name": "📈 觸底反彈 (狀態回升)", "bets": 45, "roi": 0.06},
+            "One_Man_Team":             {"name": "⭐ 單核球隊 (依賴球星)", "bets": 60, "roi": 0.00},
+            "Unknown_New_Promoted":     {"name": "🆕 升班馬衝擊 (未知數)", "bets": 25, "roi": -0.05}
+        }
+
+    def analyze_scenario(self, engine, lh, la):
+        h, a = engine.h, engine.a
+        odds = engine.market["1x2_odds"]
+        
+        # 1. 基礎特徵提取
+        prob_h = 1.0 / odds["home"]
+        is_heavy_fav = prob_h > 0.65
+        is_underdog = prob_h < 0.35
+        
+        # 戰意與狀態
+        motiv_h = h["context_modifiers"]["motivation"]
+        motiv_a = a["context_modifiers"]["motivation"]
+        form_h = sum(h["context_modifiers"]["recent_form_trend"]) # 正數代表狀態好
+        form_a = sum(a["context_modifiers"]["recent_form_trend"])
+        
+        # 攻防特質
+        xg_h, xga_h = h["offensive_stats"]["xg_avg"], h["defensive_stats"]["xga_avg"]
+        xg_a, xga_a = a["offensive_stats"]["xg_avg"], a["defensive_stats"]["xga_avg"]
+        
+        # 傷病
+        missing_h = h["context_modifiers"]["missing_key_defender"]
+        missing_a = a["context_modifiers"]["missing_key_defender"]
+
+        # --- 決策樹邏輯 (優先級從高到低) ---
+
+        # 1. 傷病與崩盤 (最高優先級風險)
+        if is_heavy_fav and missing_h and form_h < 0:
+            return "Injury_Crisis_Fav"
+        if is_heavy_fav and form_h < -2:
+            return "Fallen_Giant"
+        if form_h < -3 and motiv_h == "low":
+            return "Late_Season_Collapse"
+
+        # 2. 極端戰意
+        if motiv_h == "title_race" and is_heavy_fav and h["general_strength"]["home_advantage_weight"] > 1.1:
+            return "Title_MustWin_Home"
+        if (motiv_a == "survival" or motiv_h == "survival") and not is_heavy_fav:
+            return "Relegation_Dog"
+        if motiv_h == "low" and motiv_a == "low":
+            return "DeadRubber"
+
+        # 3. 戰術特徵
+        if h["general_strength"]["home_advantage_weight"] > 1.25 and form_h > 0:
+            return "Fortress_Home"
+        
+        # 攻強守弱互爆
+        if (xg_h > 1.6 and xga_h > 1.4) and (xg_a > 1.5 and xga_a > 1.4):
+            return "Glass_Shootout"
+        
+        # 雙重鐵桶
+        if (xg_h < 1.0 and xga_h < 1.0) and (xg_a < 1.0 and xga_a < 1.0):
+            return "Bore_Draw_Stalemate"
+            
+        # 鐵桶陣陷阱 (強隊攻弱 vs 弱隊守強)
+        if is_heavy_fav and xga_a < 1.2 and (lh+la) < 2.5:
+            return "HeavyFav_DeepBlock"
+
+        # 4. 數據挖掘
+        # 扮豬吃老虎: 賠率看衰，但 xG 數據其實很好
+        if is_underdog and xg_h > xg_a and form_h >= 0:
+            return "Hidden_Gem_Dog"
+            
+        # 客隊防反
+        if is_underdog and xg_a > 1.2 and h["style_of_play"]["volatility"] == "high":
+            return "Counter_Away_Dog"
+
+        # 5. 其他特徵
+        if h["style_of_play"]["volatility"] == "high" or a["style_of_play"]["volatility"] == "high":
+            return "Volatile_Chaos"
+            
+        # 預設
+        return "MidTable_Standard"
+
+    def recall_experience(self, regime_id):
+        return self.history_db.get(regime_id, {"name": "🔍 未知盤口", "bets": 0, "roi": 0.0})
+
+    def calc_memory_penalty(self, historical_roi):
+        # 負 ROI 嚴重懲罰，正 ROI 適度獎勵
+        if historical_roi < -0.15: return 0.4  # 大坑，打4折
+        if historical_roi < -0.05: return 0.7  # 小坑，打7折
+        if historical_roi > 0.15: return 1.2   # 黃金機會，加成20%
+        if historical_roi > 0.05: return 1.1   # 不錯，加成10%
+        return 1.0
+
+# =========================
+# 3. 分析引擎邏輯
 # =========================
 class SniperAnalystLogic:
     def __init__(self, json_data, max_g=9, nb_alpha=0.12):
@@ -47,6 +165,7 @@ class SniperAnalystLogic:
         self.market = self.data["market_data"]
         self.max_g = max_g
         self.nb_alpha = nb_alpha
+        self.memory = RegimeMemory()
 
     def calc_lambda(self):
         league_base = 1.35
@@ -57,17 +176,13 @@ class SniperAnalystLogic:
 
         h_att, h_def = att_def(self.h)
         a_att, a_def = att_def(self.a)
-
         if self.h["context_modifiers"]["missing_key_defender"]: h_def *= 1.20
         if self.a["context_modifiers"]["missing_key_defender"]: a_def *= 1.15
-
         h_adv = self.h["general_strength"]["home_advantage_weight"]
         lh = (h_att * a_def / league_base) * h_adv
         la = (a_att * h_def / league_base)
-
         if self.h["context_modifiers"]["motivation"] == "survival": lh *= 1.05
         if self.a["context_modifiers"]["motivation"] == "title_race": la *= 1.05
-
         return lh, la
 
     def get_market_trend_bonus(self):
@@ -118,56 +233,38 @@ class SniperAnalystLogic:
         return home_goals, away_goals, results
 
     def check_sensitivity(self, lh, la):
-        """
-        傳回數值化的 Sensitivity Score (0.0~1.0)，越低越穩
-        """
         M_stress = self.build_ensemble_matrix(lh, la + 0.3)
         prob_h_orig = float(np.sum(np.tril(self.build_ensemble_matrix(lh, la),-1)))
         prob_h_new = float(np.sum(np.tril(M_stress,-1)))
-        
         drop_rate = (prob_h_orig - prob_h_new) / prob_h_orig if prob_h_orig > 0 else 0
-        
         level = "Low"
         if drop_rate > 0.15: level = "High"
         elif drop_rate > 0.08: level = "Medium"
-            
         return level, drop_rate
 
     def calc_model_confidence(self, lh, la, market_diff_percent, sens_drop_rate):
         score = 1.0
         reasons = []
-
-        # 1. 市場共識懲罰
         if market_diff_percent > 0.25:
-            score *= 0.7
-            reasons.append("與市場差異過大 (>25%)，恐為模型幻覺")
+            score *= 0.7; reasons.append("與市場差異過大 (>25%)")
         elif market_diff_percent > 0.15:
-            score *= 0.85
-            reasons.append("與市場顯著分歧")
-
-        # 2. 敏感度懲罰
+            score *= 0.85; reasons.append("與市場顯著分歧")
         if sens_drop_rate > 0.15:
-            score *= 0.8
-            reasons.append("模型對運氣球極度敏感")
+            score *= 0.8; reasons.append("模型對運氣球極度敏感")
         elif sens_drop_rate > 0.08:
-            score *= 0.9
-            reasons.append("敏感度偏高")
-
-        # 3. 變異性懲罰
+            score *= 0.9; reasons.append("敏感度偏高")
         total_xg = lh + la
         if total_xg > 3.5:
-            score *= 0.9
-            reasons.append("高入球預期 (亂戰風險)")
-        
+            score *= 0.9; reasons.append("高入球預期 (亂戰風險)")
         return score, reasons
 
 # =========================
-# 3. Streamlit UI 介面
+# 4. Streamlit UI 介面
 # =========================
-st.set_page_config(page_title="狙擊手分析 V27.1 UI", page_icon="⚽", layout="wide")
+st.set_page_config(page_title="狙擊手分析 V30.0 UI", page_icon="⚽", layout="wide")
 
-st.title("⚽ 狙擊手 V27.1 信心引擎版")
-st.markdown("### 專業足球數據分析：風險定價 x 模型自我修正")
+st.title("⚽ 狙擊手 V30.0 終極劇本版")
+st.markdown("### 專業足球數據分析：20 種經典盤口記憶庫")
 
 # --- 側邊欄 ---
 with st.sidebar:
@@ -177,15 +274,17 @@ with st.sidebar:
     nb_alpha = st.slider("Alpha (變異數)", 0.05, 0.20, 0.12, 0.01)
     max_g = st.number_input("運算範圍", 5, 15, 9)
     risk_scale = st.slider("風險縮放係數", 0.1, 1.0, 0.3, 0.1)
+    st.divider()
+    use_mock_memory = st.checkbox("🧠 啟用歷史記憶模擬", value=True)
 
 # --- 輸入區 ---
 st.info("請選擇數據輸入方式：")
 tab1, tab2 = st.tabs(["📋 貼上 JSON 代碼", "📂 上傳 JSON 檔案"])
 input_data = None
-default_json = """{ "meta_info": { "league_name": "範例聯賽", "match_date": "2026-01-01" }, "market_data": { "handicaps": [0.5, 0.75], "goal_lines": [2.5, 3.0], "target_odds": 1.90, "1x2_odds": { "home": 2.40, "draw": 3.30, "away": 2.50 }, "opening_odds": { "home": 2.30, "draw": 3.30, "away": 2.60 }, "cs_odds": { "1:0": 8.0, "0:1": 8.5, "1:1": 6.5 } }, "home": { "name": "主隊範例", "general_strength": { "home_advantage_weight": 1.15 }, "offensive_stats": { "goals_scored_avg": 1.5, "xg_avg": 1.4 }, "defensive_stats": { "goals_conceded_avg": 1.2, "xga_avg": 1.3 }, "style_of_play": { "volatility": "normal" }, "context_modifiers": { "motivation": "normal", "missing_key_defender": false } }, "away": { "name": "客隊範例", "general_strength": { "home_advantage_weight": 0.9 }, "offensive_stats": { "goals_scored_avg": 1.1, "xg_avg": 1.2 }, "defensive_stats": { "goals_conceded_avg": 1.6, "xga_avg": 1.5 }, "style_of_play": { "volatility": "high" }, "context_modifiers": { "motivation": "normal", "missing_key_defender": true } } }"""
+default_json = """{ "meta_info": { "league_name": "範例聯賽", "match_date": "2026-01-01" }, "market_data": { "handicaps": [0.5, 0.75], "goal_lines": [2.5, 3.0], "target_odds": 1.90, "1x2_odds": { "home": 2.40, "draw": 3.30, "away": 2.50 }, "opening_odds": { "home": 2.30, "draw": 3.30, "away": 2.60 }, "cs_odds": { "1:0": 8.0, "0:1": 8.5, "1:1": 6.5 } }, "home": { "name": "主隊範例", "general_strength": { "home_advantage_weight": 1.15 }, "offensive_stats": { "goals_scored_avg": 1.5, "xg_avg": 1.4 }, "defensive_stats": { "goals_conceded_avg": 1.2, "xga_avg": 1.3 }, "style_of_play": { "volatility": "normal" }, "context_modifiers": { "motivation": "normal", "missing_key_defender": false, "recent_form_trend": [1, 1, 0] } }, "away": { "name": "客隊範例", "general_strength": { "home_advantage_weight": 0.9 }, "offensive_stats": { "goals_scored_avg": 1.1, "xg_avg": 1.2 }, "defensive_stats": { "goals_conceded_avg": 1.6, "xga_avg": 1.5 }, "style_of_play": { "volatility": "high" }, "context_modifiers": { "motivation": "normal", "missing_key_defender": true, "recent_form_trend": [-1, -1, 0] } } }"""
 
 with tab1:
-    json_text = st.text_area("在此貼上 JSON", value=default_json, height=150)
+    json_text = st.text_area("在此貼上 JSON (V30: 建議包含 recent_form_trend)", value=default_json, height=150)
     if json_text:
         try: input_data = json.loads(json_text)
         except: st.error("JSON 格式錯誤")
@@ -200,6 +299,12 @@ if st.button("🚀 開始全方位分析", type="primary"):
     if not input_data:
         st.error("請先輸入有效的比賽數據！")
     else:
+        # 兼容性檢查：如果舊版 JSON 沒有 recent_form_trend，補上預設值
+        if "recent_form_trend" not in input_data["home"]["context_modifiers"]:
+            input_data["home"]["context_modifiers"]["recent_form_trend"] = [0,0,0]
+        if "recent_form_trend" not in input_data["away"]["context_modifiers"]:
+            input_data["away"]["context_modifiers"]["recent_form_trend"] = [0,0,0]
+
         engine = SniperAnalystLogic(input_data, max_g, nb_alpha)
         
         # 1. 基礎計算
@@ -207,8 +312,42 @@ if st.button("🚀 開始全方位分析", type="primary"):
         M = engine.build_ensemble_matrix(lh, la)
         market_bonus = engine.get_market_trend_bonus()
         
-        # 2. 顯示對戰
-        st.divider()
+        # 2. V30: 全景記憶識別
+        regime_id = engine.memory.analyze_scenario(engine, lh, la)
+        history_data = {"name": "未知", "bets": 0, "roi": 0.0}
+        memory_penalty = 1.0
+        
+        if use_mock_memory:
+            history_data = engine.memory.recall_experience(regime_id)
+            memory_penalty = engine.memory.calc_memory_penalty(history_data["roi"])
+
+        # 3. 信心分數
+        prob_h = float(np.sum(np.tril(M,-1)))
+        imp_h = 1.0 / engine.market["1x2_odds"]["home"]
+        diff_h = max(0, prob_h - imp_h)
+        sens_level, sens_drop = engine.check_sensitivity(lh, la)
+        model_conf_score, conf_reasons = engine.calc_model_confidence(lh, la, diff_h, sens_drop)
+        
+        # 4. 側邊欄
+        with st.sidebar:
+            st.divider()
+            st.subheader("🧠 盤口劇本識別")
+            st.info(f"{history_data['name']}")
+            
+            if use_mock_memory:
+                col_h1, col_h2 = st.columns(2)
+                col_h1.metric("歷史樣本", f"{history_data['bets']}場")
+                col_h2.metric("歷史 ROI", f"{history_data['roi']*100:.1f}%", delta_color="normal" if history_data['roi'] > 0 else "inverse")
+                
+                if memory_penalty < 1.0: st.error(f"⚠️ 陷阱懲罰: EV x {memory_penalty}")
+                elif memory_penalty > 1.0: st.success(f"🔥 機會加成: EV x {memory_penalty}")
+            else: st.caption("記憶模擬未啟用")
+
+            st.divider()
+            st.subheader("🛡️ 模型信心")
+            st.metric("Confidence", f"{model_conf_score*100:.0f}/100")
+
+        # 5. 顯示對戰
         col1, col2, col3 = st.columns([1, 0.2, 1])
         with col1:
             st.markdown(f"<h3 style='text-align: right; color: #1f77b4;'>{engine.h['name']}</h3>", unsafe_allow_html=True)
@@ -218,50 +357,30 @@ if st.button("🚀 開始全方位分析", type="primary"):
             st.markdown(f"<h3 style='text-align: left; color: #ff7f0e;'>{engine.a['name']}</h3>", unsafe_allow_html=True)
             st.metric("預期進球", f"{la:.2f}")
 
-        prob_h = float(np.sum(np.tril(M,-1)))
         prob_d = float(np.sum(np.diag(M)))
         prob_a = float(np.sum(np.triu(M,1)))
 
-        # V27: 計算全場信心分數
-        sens_level, sens_drop = engine.check_sensitivity(lh, la)
-        imp_h = 1.0 / engine.market["1x2_odds"]["home"]
-        diff_h = max(0, prob_h - imp_h)
-        model_conf_score, conf_reasons = engine.calc_model_confidence(lh, la, diff_h, sens_drop)
-        
-        with st.sidebar:
-            st.divider()
-            st.subheader("🛡️ 模型自我信心")
-            st.metric("Confidence Score", f"{model_conf_score*100:.0f}/100")
-            if conf_reasons:
-                st.caption("扣分原因：")
-                for r in conf_reasons: st.caption(f"- {r}")
-            else:
-                st.caption("✅ 模型對當前判斷非常有信心")
-
-        res_tab1, res_tab2, res_tab3, res_tab4 = st.tabs(["📊 價值與信心修正", "🧠 智能裁決", "🎯 波膽分佈", "🎲 模擬與雷達"])
+        res_tab1, res_tab2, res_tab3, res_tab4 = st.tabs(["📊 價值與劇本修正", "🧠 智能裁決", "🎯 波膽分佈", "🎲 模擬與雷達"])
 
         candidates = []
 
-        # --- Tab 1: 價值與風險定價 ---
         with res_tab1:
-            st.subheader("💰 獨贏 (1x2) - 信心修正版")
+            st.subheader("💰 獨贏 (1x2) - 劇本修正版")
             rows_1x2 = []
             for tag, prob, key in [("主勝", prob_h, "home"), ("和局", prob_d, "draw"), ("客勝", prob_a, "away")]:
                 odd = engine.market["1x2_odds"][key]
                 raw_ev = (prob * odd - 1) * 100 + market_bonus[key]
-                adj_ev = raw_ev * model_conf_score
+                adj_ev = raw_ev * model_conf_score * memory_penalty
                 
                 var, sharpe = calc_risk_metrics(prob, odd)
                 kelly_pct = calc_risk_adj_kelly(adj_ev, var, risk_scale)
-                
-                # V27.1: 加回「預計獲利」與「賠率」
                 profit = (odd - 1) * unit_stake
                 
                 rows_1x2.append({
                     "選項": tag, "賠率": odd, 
                     "原始 EV": f"{raw_ev:+.1f}%",
                     "修正 EV": f"{adj_ev:+.1f}%",
-                    "預計獲利": f"${profit:.1f}", # V27.1 加回
+                    "預計獲利": f"${profit:.1f}",
                     "夏普值": f"{sharpe:.2f}",
                     "建議注碼%": f"{kelly_pct:.1f}%"
                 })
@@ -279,22 +398,18 @@ if st.button("🚀 開始全方位分析", type="primary"):
                 d_ah = []
                 for hcap in engine.market["handicaps"]:
                     raw_ev = engine.ah_ev(M, hcap, engine.market["target_odds"]) + market_bonus["home"]
-                    adj_ev = raw_ev * model_conf_score
+                    adj_ev = raw_ev * model_conf_score * memory_penalty
                     
                     target_o = engine.market["target_odds"]
                     prob_approx = (raw_ev/100.0 + 1) / target_o
                     var, sharpe = calc_risk_metrics(prob_approx, target_o)
                     kelly_pct = calc_risk_adj_kelly(adj_ev, var, risk_scale)
-                    
-                    # V27.1: 加回「賠率」與「預計獲利」
                     profit = (target_o - 1) * unit_stake
 
                     d_ah.append({
-                        "盤口": f"主 {hcap:+}", "賠率": target_o, # V27.1 加回
-                        "修正 EV": f"{adj_ev:+.1f}%", 
-                        "預計獲利": f"${profit:.1f}", # V27.1 加回
-                        "夏普值": f"{sharpe:.2f}", 
-                        "建議注碼%": f"{kelly_pct:.1f}%"
+                        "盤口": f"主 {hcap:+}", "賠率": target_o, 
+                        "修正 EV": f"{adj_ev:+.1f}%", "預計獲利": f"${profit:.1f}",
+                        "夏普值": f"{sharpe:.2f}", "建議注碼%": f"{kelly_pct:.1f}%"
                     })
                     if adj_ev > 2: 
                         candidates.append({
@@ -310,21 +425,17 @@ if st.button("🚀 開始全方位分析", type="primary"):
                 for line in engine.market["goal_lines"]:
                     op = sum(M[i,j] for i in range(9) for j in range(9) if i+j>line)
                     raw_ev = (op * engine.market["target_odds"] - 1) * 100
-                    adj_ev = raw_ev * model_conf_score
+                    adj_ev = raw_ev * model_conf_score * memory_penalty
                     
                     target_o = engine.market["target_odds"]
                     var, sharpe = calc_risk_metrics(op, target_o)
                     kelly_pct = calc_risk_adj_kelly(adj_ev, var, risk_scale)
-                    
-                    # V27.1: 加回「賠率」與「預計獲利」
                     profit = (target_o - 1) * unit_stake
 
                     d_ou.append({
-                        "盤口": f"大 {line}", "賠率": target_o, # V27.1 加回
-                        "修正 EV": f"{adj_ev:+.1f}%",
-                        "預計獲利": f"${profit:.1f}", # V27.1 加回
-                        "夏普值": f"{sharpe:.2f}", 
-                        "建議注碼%": f"{kelly_pct:.1f}%"
+                        "盤口": f"大 {line}", "賠率": target_o, 
+                        "修正 EV": f"{adj_ev:+.1f}%", "預計獲利": f"${profit:.1f}",
+                        "夏普值": f"{sharpe:.2f}", "建議注碼%": f"{kelly_pct:.1f}%"
                     })
                     if adj_ev > 2: 
                         candidates.append({
@@ -334,20 +445,17 @@ if st.button("🚀 開始全方位分析", type="primary"):
                         })
                 st.dataframe(pd.DataFrame(d_ou), use_container_width=True)
 
-            # 最佳推薦
-            st.subheader("📝 智能投資組合 (信心加權)")
+            st.subheader("📝 智能投資組合 (劇本加權)")
             if candidates:
                 final = sorted(candidates, key=lambda x:x["ev"], reverse=True)[:3]
-                no_bet_flag = False
-                no_bet_reason = []
+                no_bet_flag = False; no_bet_reason = []
                 
+                if use_mock_memory and history_data['roi'] < -0.10:
+                     no_bet_flag = True
+                     no_bet_reason.append(f"劇本警示：此劇本 ({history_data['name']}) 歷史嚴重虧損，建議避開")
+
                 if model_conf_score < 0.6:
-                    no_bet_flag = True
-                    no_bet_reason.append(f"模型信心過低 ({model_conf_score*100:.0f}/100)，建議觀望")
-                
-                top = final[0]
-                if top['sens'] == "High" and top['ev'] < 10:
-                    no_bet_flag = True; no_bet_reason.append("首選注單脆弱")
+                    no_bet_flag = True; no_bet_reason.append(f"模型信心過低 ({model_conf_score*100:.0f}/100)")
                 
                 if no_bet_flag:
                     st.error(f"🛑 系統建議觀望 (NO BET)")
@@ -358,13 +466,10 @@ if st.button("🚀 開始全方位分析", type="primary"):
                         bet_amount = unit_stake * (p['kelly'] / 10.0)
                         risk_icon = "🟢" if p['sharpe'] > 0.1 else ("🟡" if p['sharpe'] > 0.05 else "🔴")
                         reco.append([
-                            f"[{p['type']}] {p['pick']}", 
-                            p['odds'], 
-                            f"{p['raw_ev']:+.1f}%",  
-                            f"{p['ev']:+.1f}%",      
+                            f"[{p['type']}] {p['pick']}", p['odds'], 
+                            f"{p['raw_ev']:+.1f}%", f"{p['ev']:+.1f}%",      
                             f"{risk_icon} {p['sharpe']:.3f}", 
-                            f"{p['kelly']:.1f}%", 
-                            f"${bet_amount:.1f}"
+                            f"{p['kelly']:.1f}%", f"${bet_amount:.1f}"
                         ])
                     st.dataframe(pd.DataFrame(reco, columns=["選項", "賠率", "原始EV", "修正EV", "夏普值", "注碼%", "建議金額"]), use_container_width=True)
             else:
@@ -413,7 +518,9 @@ if st.button("🚀 開始全方位分析", type="primary"):
             st.subheader("⚔️ 戰力雷達")
             cats = ['Attack', 'Defense', 'Form', 'Home/Away', 'Motivation']
             def get_s(stats):
-                return [min(10, stats["offensive_stats"]["xg_avg"]*4), min(10, (3-stats["defensive_stats"]["xga_avg"])*3.5), sum(stats["context_modifiers"]["recent_form_trend"])*2, stats["general_strength"]["home_advantage_weight"]*5, 8 if stats["context_modifiers"]["motivation"]!="normal" else 5]
+                form_val = sum(stats.get("context_modifiers", {}).get("recent_form_trend", [0,0,0]))
+                form_score = (form_val + 3) * 1.5 # 簡單正規化
+                return [min(10, stats["offensive_stats"]["xg_avg"]*4), min(10, (3-stats["defensive_stats"]["xga_avg"])*3.5), form_score, stats["general_strength"]["home_advantage_weight"]*5, 8 if stats["context_modifiers"]["motivation"]!="normal" else 5]
             
             hs, ans = get_s(engine.h), get_s(engine.a)
             N = len(cats); ang = [n/float(N)*2*math.pi for n in range(N)]; ang+=ang[:1]; hs+=hs[:1]; ans+=ans[:1]
