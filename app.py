@@ -6,7 +6,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 # =========================
-# 1. 核心數學工具
+# 1. 核心數學工具 (V26.2 升級版)
 # =========================
 def poisson_pmf(k, lam):
     return math.exp(-lam) * lam**k / math.factorial(k)
@@ -19,12 +19,26 @@ def nb_pmf(k, mu, alpha):
     coeff = math.exp(math.lgamma(k + r) - math.lgamma(r) - math.lgamma(k + 1))
     return float(coeff * (p ** r) * ((1 - p) ** k))
 
-def calc_kelly(prob, odds, fraction=0.4):
-    if prob <= 0 or odds <= 1:
+# V26.2 新增：風險調整注碼計算 (Risk-Adjusted Kelly)
+def calc_risk_adj_kelly(ev_percent, variance, risk_scale=0.5):
+    """
+    使用 Mean-Variance 優化邏輯替代傳統 Kelly
+    f = (EV / Variance) * Risk_Scale
+    ev_percent: 期望值 (例如 5.0 代表 5%)
+    variance: 收益的變異數
+    risk_scale: 風險縮放係數 (類似 Kelly Fraction)
+    """
+    if variance <= 0 or ev_percent <= 0:
         return 0.0
-    b = odds - 1.0
-    f = (b * prob - (1 - prob)) / b
-    return max(0.0, f * fraction) * 100
+    
+    # 將百分比轉回小數計算
+    ev = ev_percent / 100.0
+    
+    # 公式：f = E / Var * c
+    f = (ev / variance) * risk_scale
+    
+    # 限制最大單注不超過 50% (安全閥)
+    return min(0.5, max(0.0, f)) * 100
 
 # =========================
 # 2. 分析引擎邏輯
@@ -107,30 +121,49 @@ class SniperAnalystLogic:
             else: results.append("away")
         return home_goals, away_goals, results
 
-    # V26: 壓力測試 (通用版)
     def check_sensitivity(self, lh, la, pick_type, original_ev):
-        # 簡單模擬：如果客隊運氣變好 (+0.3 xG)，這個盤口的優勢還在嗎？
         M_stress = self.build_ensemble_matrix(lh, la + 0.3)
-        
-        # 這裡為了效能，我們用一個簡化的 "Robustness Score"
-        # 我們比較 "主勝機率" 在壓力下的跌幅，作為全場波動的指標
         prob_h_orig = float(np.sum(np.tril(self.build_ensemble_matrix(lh, la),-1)))
         prob_h_new = float(np.sum(np.tril(M_stress,-1)))
-        
         drop_rate = (prob_h_orig - prob_h_new) / prob_h_orig if prob_h_orig > 0 else 0
-        
-        # 根據跌幅給出評級
         if drop_rate > 0.15: return "High", "脆弱"
         elif drop_rate > 0.08: return "Medium", "普通"
         else: return "Low", "堅固"
 
+    # V26.2 新增：計算變異數 (Variance) 與夏普值 (Sharpe)
+    def calc_risk_metrics(self, prob, odds):
+        """
+        計算該注單的統計風險特徵
+        Returns: Variance, Sharpe
+        """
+        if prob <= 0 or prob >= 1: return 0.0, 0.0
+        
+        # 贏的時候賺 (odds-1)，輸的時候賠 1
+        win_payoff = odds - 1.0
+        lose_payoff = -1.0
+        
+        # E[X] = p * win + (1-p) * lose
+        expected_val = prob * win_payoff + (1 - prob) * lose_payoff
+        
+        # E[X^2] = p * win^2 + (1-p) * lose^2
+        expected_sq = prob * (win_payoff**2) + (1 - prob) * (lose_payoff**2)
+        
+        # Var(X) = E[X^2] - (E[X])^2
+        variance = expected_sq - (expected_val**2)
+        
+        # Sharpe = E[X] / StdDev(X)
+        std_dev = math.sqrt(variance)
+        sharpe = expected_val / std_dev if std_dev > 0 else 0
+        
+        return variance, sharpe
+
 # =========================
 # 3. Streamlit UI 介面
 # =========================
-st.set_page_config(page_title="狙擊手分析 V26.1 UI", page_icon="⚽", layout="wide")
+st.set_page_config(page_title="狙擊手分析 V26.2 UI", page_icon="⚽", layout="wide")
 
-st.title("⚽ 狙擊手 V26.1 風險控管版")
-st.markdown("### 專業足球數據分析：EV 拆解 x 壓力測試 x 棄單邏輯")
+st.title("⚽ 狙擊手 V26.2 量化決策版")
+st.markdown("### 專業足球數據分析：風險定價 x 波動調節 x 智能注碼")
 
 # --- 側邊欄 ---
 with st.sidebar:
@@ -139,7 +172,8 @@ with st.sidebar:
     st.divider()
     nb_alpha = st.slider("Alpha (變異數)", 0.05, 0.20, 0.12, 0.01)
     max_g = st.number_input("運算範圍", 5, 15, 9)
-    kelly_frac = st.slider("Kelly 比例", 0.1, 1.0, 0.4, 0.1)
+    # V26.2 更新：改名為風險係數
+    risk_scale = st.slider("風險縮放係數 (Risk Scale)", 0.1, 1.0, 0.3, 0.1, help="數值越小，系統面對高波動注單時砍注越兇。建議 0.3-0.5。")
 
 # --- 輸入區 ---
 st.info("請選擇數據輸入方式：")
@@ -185,119 +219,132 @@ if st.button("🚀 開始全方位分析", type="primary"):
         prob_d = float(np.sum(np.diag(M)))
         prob_a = float(np.sum(np.triu(M,1)))
 
-        # V26 Tab 架構
-        res_tab1, res_tab2, res_tab3, res_tab4 = st.tabs(["📊 價值與風險拆解", "🧠 智能裁決", "🎯 波膽分佈", "🎲 模擬與雷達"])
+        # V26.2 Tab 架構
+        res_tab1, res_tab2, res_tab3, res_tab4 = st.tabs(["📊 價值與風險定價", "🧠 智能裁決", "🎯 波膽分佈", "🎲 模擬與雷達"])
 
         candidates = []
 
-        # --- Tab 1: 價值分析 (V26.1: 修正顯示問題，套用至所有表格) ---
+        # --- Tab 1: 價值與風險定價 ---
         with res_tab1:
-            st.subheader("💰 獨贏 (1x2) 深度分析")
+            st.subheader("💰 獨贏 (1x2) 風險定價")
             rows_1x2 = []
             for tag, prob, key in [("主勝", prob_h, "home"), ("和局", prob_d, "draw"), ("客勝", prob_a, "away")]:
                 odd = engine.market["1x2_odds"][key]
                 total_ev = (prob * odd - 1) * 100 + market_bonus[key]
-                profit = (odd - 1) * unit_stake
                 
-                # EV 拆解
-                implied_prob = 1.0 / odd
-                raw_edge = (prob - implied_prob) * 100
-                leverage = total_ev - raw_edge
+                # V26.2: 計算 Variance 與 Sharpe
+                var, sharpe = engine.calc_risk_metrics(prob, odd)
+                
+                # V26.2: 計算風險調整注碼
+                kelly_pct = calc_risk_adj_kelly(total_ev, var, risk_scale)
+                final_stake = unit_stake * (kelly_pct / 100 * 10) # 假設 unit_stake 是基準，這裡只顯示比例概念，或直接顯示建議金額
+                final_stake_amt = (unit_stake * kelly_pct) / 10 # 這裡做個調整，讓顯示數字合理化
+                
+                # 獲利計算 (基於風險調整後的建議注碼，這裡為了簡單顯示，還是用本金算，但在 Top Picks 會用風險注碼)
+                profit = (odd - 1) * unit_stake
                 
                 # 壓力測試
                 sens_level, sens_desc = engine.check_sensitivity(lh, la, tag, total_ev)
                 
                 rows_1x2.append({
-                    "選項": tag, "賠率": odd, "模型機率": f"{prob*100:.1f}%", "總 EV": f"{total_ev:+.1f}%",
-                    "EV 來源 (優勢|槓桿)": f"{raw_edge:+.1f}% | {leverage:+.1f}%",
-                    "壓力測試": sens_desc, "預計獲利": f"${profit:.1f}"
+                    "選項": tag, "賠率": odd, "EV": f"{total_ev:+.1f}%",
+                    "波動 (Var)": f"{var:.2f}",
+                    "夏普值": f"{sharpe:.2f}", # 越高越好
+                    "壓力": sens_desc, 
+                    "建議注碼%": f"{kelly_pct:.1f}%"
                 })
-                if total_ev > 1.5: candidates.append({"type":"1x2", "pick":tag, "ev":total_ev, "odds":odd, "prob":prob, "sens": sens_level})
+                if total_ev > 1.5: 
+                    candidates.append({
+                        "type":"1x2", "pick":tag, "ev":total_ev, "odds":odd, "prob":prob, 
+                        "sens": sens_level, "var": var, "sharpe": sharpe, "kelly": kelly_pct
+                    })
             st.dataframe(pd.DataFrame(rows_1x2), use_container_width=True)
 
-            # 亞盤 (V26.1 修正：加入 EV 來源與壓力測試)
+            # 亞盤與大小球
             c_ah, c_ou = st.columns(2)
             with c_ah:
                 st.subheader("🛡️ 亞盤")
                 d_ah = []
                 for hcap in engine.market["handicaps"]:
                     ev = engine.ah_ev(M, hcap, engine.market["target_odds"]) + market_bonus["home"]
-                    profit = (engine.market["target_odds"]-1)*unit_stake
-                    
-                    # 亞盤 EV 拆解 (反推模型勝率)
+                    # 亞盤機率近似反推
                     target_o = engine.market["target_odds"]
-                    implied_p = 1.0 / target_o
-                    # EV = (Prob * Odds - 1) -> Prob = (EV + 1) / Odds (近似值，含 Market Bonus)
-                    model_p_approx = (ev/100.0 + 1) / target_o
-                    raw_edge = (model_p_approx - implied_p) * 100
-                    leverage = ev - raw_edge
+                    prob_approx = (ev/100.0 + 1) / target_o
                     
+                    var, sharpe = engine.calc_risk_metrics(prob_approx, target_o)
+                    kelly_pct = calc_risk_adj_kelly(ev, var, risk_scale)
                     sens_level, sens_desc = engine.check_sensitivity(lh, la, "AH", ev)
                     
                     d_ah.append({
                         "盤口": f"主 {hcap:+}", "EV": f"{ev:+.1f}%", 
-                        "來源 (優|槓)": f"{raw_edge:+.1f}|{leverage:+.1f}",
-                        "壓力": sens_desc, "獲利": f"${profit:.1f}"
+                        "夏普值": f"{sharpe:.2f}",
+                        "建議注碼%": f"{kelly_pct:.1f}%"
                     })
-                    if ev > 2: candidates.append({"type":"AH", "pick":f"主 {hcap:+}", "ev":ev, "odds":target_o, "prob":model_p_approx, "sens":"Medium"})
+                    if ev > 2: 
+                        candidates.append({
+                            "type":"AH", "pick":f"主 {hcap:+}", "ev":ev, "odds":target_o, "prob":prob_approx, 
+                            "sens":"Medium", "var": var, "sharpe": sharpe, "kelly": kelly_pct
+                        })
                 st.dataframe(pd.DataFrame(d_ah), use_container_width=True)
             
-            # 大小球 (V26.1 修正：加入 EV 來源與壓力測試)
             with c_ou:
                 st.subheader("📐 大小球")
                 d_ou = []
                 for line in engine.market["goal_lines"]:
                     op = sum(M[i,j] for i in range(9) for j in range(9) if i+j>line)
                     ev = (op * engine.market["target_odds"] - 1) * 100
-                    profit = (engine.market["target_odds"]-1)*unit_stake
-                    
                     target_o = engine.market["target_odds"]
-                    implied_p = 1.0 / target_o
-                    raw_edge = (op - implied_p) * 100
-                    leverage = ev - raw_edge
                     
+                    var, sharpe = engine.calc_risk_metrics(op, target_o)
+                    kelly_pct = calc_risk_adj_kelly(ev, var, risk_scale)
                     sens_level, sens_desc = engine.check_sensitivity(lh, la, "OU", ev)
                     
                     d_ou.append({
-                        "盤口": f"大 {line}", "機率": f"{op*100:.1f}%", "EV": f"{ev:+.1f}%",
-                        "來源 (優|槓)": f"{raw_edge:+.1f}|{leverage:+.1f}",
-                        "壓力": sens_desc, "獲利": f"${profit:.1f}"
+                        "盤口": f"大 {line}", "EV": f"{ev:+.1f}%",
+                        "夏普值": f"{sharpe:.2f}",
+                        "建議注碼%": f"{kelly_pct:.1f}%"
                     })
-                    if ev > 2: candidates.append({"type":"OU", "pick":f"大 {line}", "ev":ev, "odds":target_o, "prob":op, "sens":"Medium"})
+                    if ev > 2: 
+                        candidates.append({
+                            "type":"OU", "pick":f"大 {line}", "ev":ev, "odds":target_o, "prob":op, 
+                            "sens":"Medium", "var": var, "sharpe": sharpe, "kelly": kelly_pct
+                        })
                 st.dataframe(pd.DataFrame(d_ou), use_container_width=True)
 
-            # 最佳推薦
-            st.subheader("📝 智能投資決策 (Top Picks)")
+            # 最佳推薦 (V26.2: 顯示風險定價後的結果)
+            st.subheader("📝 智能投資組合 (Smart Portfolio)")
             if candidates:
+                # 排序改用 Sharpe 值 (CP值) 或 EV 綜合考量，這裡我們還是先看 EV，但在表中強調風險
                 final = sorted(candidates, key=lambda x:x["ev"], reverse=True)[:3]
+                
                 no_bet_flag = False
                 no_bet_reason = []
-                
                 top = final[0]
                 if top['sens'] == "High" and top['ev'] < 15:
-                    no_bet_flag = True
-                    no_bet_reason.append("首選注單對運氣波動過於敏感 (脆弱優勢)")
+                    no_bet_flag = True; no_bet_reason.append("首選注單脆弱")
                 
-                if len(final) >= 2:
-                    p1, p2 = final[0], final[1]
-                    def gdir(n):
-                        if "主" in n: return "HOME"
-                        if "客" in n: return "AWAY"
-                        return "NONE"
-                    if gdir(p1['pick']) != "NONE" and gdir(p1['pick']) == gdir(p2['pick']):
-                        no_bet_reason.append("前兩名選項方向重疊，風險過度集中")
-
                 if no_bet_flag:
                     st.error(f"🛑 系統建議觀望 (NO BET)")
                     for r in no_bet_reason: st.write(f"- {r}")
                 else:
                     reco = []
                     for p in final:
-                        k = calc_kelly(p["prob"], p["odds"], kelly_frac)
-                        prof = (p["odds"]-1)*unit_stake
-                        sens_icon = "🟢" if p['sens']=="Low" else ("🟡" if p['sens']=="Medium" else "🔴")
-                        reco.append([f"[{p['type']}] {p['pick']}", p['odds'], f"{p['ev']:+.1f}%", f"{sens_icon} {p['sens']}", f"{k:.1f}%", f"${prof:.1f}"])
-                    st.dataframe(pd.DataFrame(reco, columns=["選項", "賠率", "EV", "穩健度", "注碼%", "獲利"]), use_container_width=True)
+                        # 這裡計算真實建議下注金額
+                        # 假設 unit_stake 是你的 "Max Stake" (例如 100鎂)，kelly_pct 是比例
+                        # 為了安全，我們把 kelly_pct 映射到本金
+                        bet_amount = unit_stake * (p['kelly'] / 10.0) # 簡單縮放，避免數字太大
+                        
+                        risk_icon = "🟢" if p['sharpe'] > 0.1 else ("🟡" if p['sharpe'] > 0.05 else "🔴")
+                        reco.append([
+                            f"[{p['type']}] {p['pick']}", 
+                            p['odds'], 
+                            f"{p['ev']:+.1f}%", 
+                            f"{risk_icon} {p['sharpe']:.3f}", 
+                            f"{p['kelly']:.1f}%", 
+                            f"${bet_amount:.1f}"
+                        ])
+                    st.dataframe(pd.DataFrame(reco, columns=["選項", "賠率", "EV", "夏普值(穩)", "風險注碼%", "建議金額"]), use_container_width=True)
+                    st.caption("💡 夏普值 (Sharpe) 越高代表風險回報比越好。建議金額已根據波動率自動調整。")
             else:
                 st.info("無適合注單")
 
