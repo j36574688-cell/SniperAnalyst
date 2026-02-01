@@ -238,9 +238,9 @@ class SniperAnalystLogic:
 # =========================
 # 4. Streamlit UI 介面
 # =========================
-st.set_page_config(page_title="狙擊手分析 V31.2 UI", page_icon="⚽", layout="wide")
+st.set_page_config(page_title="狙擊手分析 V31.3 UI", page_icon="⚽", layout="wide")
 
-st.title("⚽ 狙擊手 V31.2 效能與邏輯終極修正版")
+st.title("⚽ 狙擊手 V31.3 修復版")
 st.markdown("### 專業足球數據分析：向量化加速 x 隨機性控制 x 數據一致性")
 
 # --- 側邊欄 ---
@@ -533,6 +533,9 @@ if st.button("🚀 開始全方位分析", type="primary"):
             sh, sa, sr = engine.run_monte_carlo(lh, la, sims=5000, seed=seed_val)
             
             sim_count = len(sr)
+            # V31.3: 補上這行 UI 佈局，防止 sc1 NameError
+            sc1, sc2, sc3 = st.columns(3)
+            
             sc1.metric("主勝率", f"{sr.count('home')/sim_count*100:.1f}%")
             sc2.metric("和局率", f"{sr.count('draw')/sim_count*100:.1f}%")
             sc3.metric("客勝率", f"{sr.count('away')/sim_count*100:.1f}%")
