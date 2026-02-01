@@ -97,42 +97,60 @@ class SniperAnalystLogic:
                 ev += M[i,j]*p
         return ev*100
 
-    # V25 新增：蒙地卡羅模擬核心
     def run_monte_carlo(self, lh, la, sims=5000):
-        # 模擬 5000 場比賽的進球分佈
         home_goals = np.random.poisson(lh, sims)
         away_goals = np.random.poisson(la, sims)
-        
         results = []
         for hg, ag in zip(home_goals, away_goals):
             if hg > ag: results.append("home")
             elif hg == ag: results.append("draw")
             else: results.append("away")
-            
         return home_goals, away_goals, results
+
+    # V26 新增：壓力測試 (One-Goal Sensitivity)
+    def check_sensitivity(self, lh, la, pick_type, original_ev):
+        # 模擬變數：假設雙方各多進 0.3 球 (模擬運氣/紅牌/誤判波動)
+        # 1. 主隊運氣好 (+0.3 xG)
+        M_plus_h = self.build_ensemble_matrix(lh + 0.3, la)
+        # 2. 客隊運氣好 (+0.3 xG)
+        M_plus_a = self.build_ensemble_matrix(lh, la + 0.3)
+        
+        # 重新計算 EV (這裡簡化，只針對 1x2 主勝/客勝做示範)
+        # 實際應用需針對具體選項重算，這裡為通用性做一個 "Robustness Score"
+        
+        prob_h_orig = float(np.sum(np.tril(self.build_ensemble_matrix(lh, la),-1)))
+        prob_h_new = float(np.sum(np.tril(M_plus_a,-1))) # 客隊變強，主勝機率掉多少
+        
+        drop_rate = (prob_h_orig - prob_h_new) / prob_h_orig if prob_h_orig > 0 else 0
+        
+        # 如果因為客隊稍微運氣好，主勝機率就暴跌 > 20%，代表盤口脆弱
+        if drop_rate > 0.20:
+            return "High", f"脆弱 (波動跌幅 {drop_rate*100:.1f}%)"
+        elif drop_rate > 0.10:
+            return "Medium", f"普通 (波動跌幅 {drop_rate*100:.1f}%)"
+        else:
+            return "Low", f"堅固 (波動跌幅 {drop_rate*100:.1f}%)"
 
 # =========================
 # 3. Streamlit UI 介面
 # =========================
-st.set_page_config(page_title="狙擊手分析 V25.0 UI", page_icon="⚽", layout="wide")
+st.set_page_config(page_title="狙擊手分析 V26.0 UI", page_icon="⚽", layout="wide")
 
-st.title("⚽ 狙擊手 V25.0 戰情室")
-st.markdown("### 專業足球數據分析：獲利計算 x 戰局模擬 x 價值注單")
+st.title("⚽ 狙擊手 V26.0 風險控管版")
+st.markdown("### 專業足球數據分析：EV 拆解 x 壓力測試 x 棄單邏輯")
 
-# --- 側邊欄設定 ---
+# --- 側邊欄 ---
 with st.sidebar:
     st.header("⚙️ 參數設定")
-    # V25 新增：獲利計算設定
-    unit_stake = st.number_input("💰 設定單注本金 ($)", min_value=10, value=100, step=10, help="輸入你的單注金額，系統將自動計算預計獲利")
+    unit_stake = st.number_input("💰 設定單注本金 ($)", min_value=10, value=100, step=10)
     st.divider()
-    nb_alpha = st.slider("負二項分佈 Alpha (變異數)", 0.05, 0.20, 0.12, 0.01)
-    max_g = st.number_input("最大進球數運算範圍", 5, 15, 9)
-    kelly_frac = st.slider("凱利公式比例 (Kelly Fraction)", 0.1, 1.0, 0.4, 0.1)
+    nb_alpha = st.slider("Alpha (變異數)", 0.05, 0.20, 0.12, 0.01)
+    max_g = st.number_input("運算範圍", 5, 15, 9)
+    kelly_frac = st.slider("Kelly 比例", 0.1, 1.0, 0.4, 0.1)
 
-# --- 數據輸入區 ---
+# --- 輸入區 ---
 st.info("請選擇數據輸入方式：")
 tab1, tab2 = st.tabs(["📋 貼上 JSON 代碼", "📂 上傳 JSON 檔案"])
-
 input_data = None
 default_json = """{ "meta_info": { "league_name": "範例聯賽", "match_date": "2026-01-01" }, "market_data": { "handicaps": [0.5, 0.75], "goal_lines": [2.5, 3.0], "target_odds": 1.90, "1x2_odds": { "home": 2.40, "draw": 3.30, "away": 2.50 }, "opening_odds": { "home": 2.30, "draw": 3.30, "away": 2.60 }, "cs_odds": { "1:0": 8.0, "0:1": 8.5, "1:1": 6.5 } }, "home": { "name": "主隊範例", "general_strength": { "home_advantage_weight": 1.15 }, "offensive_stats": { "goals_scored_avg": 1.5, "xg_avg": 1.4 }, "defensive_stats": { "goals_conceded_avg": 1.2, "xga_avg": 1.3 }, "style_of_play": { "volatility": "normal" }, "context_modifiers": { "motivation": "normal", "missing_key_defender": false } }, "away": { "name": "客隊範例", "general_strength": { "home_advantage_weight": 0.9 }, "offensive_stats": { "goals_scored_avg": 1.1, "xg_avg": 1.2 }, "defensive_stats": { "goals_conceded_avg": 1.6, "xga_avg": 1.5 }, "style_of_play": { "volatility": "high" }, "context_modifiers": { "motivation": "normal", "missing_key_defender": true } } }"""
 
@@ -147,197 +165,187 @@ with tab2:
         try: input_data = json.load(uploaded_file)
         except: st.error("檔案讀取失敗")
 
-# --- 執行分析按鈕 ---
+# --- 執行分析 ---
 if st.button("🚀 開始全方位分析", type="primary"):
     if not input_data:
         st.error("請先輸入有效的比賽數據！")
     else:
-        # 初始化分析引擎
         engine = SniperAnalystLogic(input_data, max_g, nb_alpha)
         
-        # 1. 計算數據
+        # 1. 基礎計算
         lh, la = engine.calc_lambda()
         M = engine.build_ensemble_matrix(lh, la)
         market_bonus = engine.get_market_trend_bonus()
         
-        # 2. 顯示對戰資訊
+        # 2. 顯示對戰
         st.divider()
         col1, col2, col3 = st.columns([1, 0.2, 1])
         with col1:
             st.markdown(f"<h3 style='text-align: right; color: #1f77b4;'>{engine.h['name']}</h3>", unsafe_allow_html=True)
-            st.metric("預期進球 (Lambda)", f"{lh:.2f}")
-        with col2:
-            st.markdown("<h3 style='text-align: center;'>VS</h3>", unsafe_allow_html=True)
+            st.metric("預期進球", f"{lh:.2f}")
+        with col2: st.markdown("<h3 style='text-align: center;'>VS</h3>", unsafe_allow_html=True)
         with col3:
             st.markdown(f"<h3 style='text-align: left; color: #ff7f0e;'>{engine.a['name']}</h3>", unsafe_allow_html=True)
-            st.metric("預期進球 (Lambda)", f"{la:.2f}")
+            st.metric("預期進球", f"{la:.2f}")
 
-        # 3. 計算機率
         prob_h = float(np.sum(np.tril(M,-1)))
         prob_d = float(np.sum(np.diag(M)))
         prob_a = float(np.sum(np.triu(M,1)))
 
-        # --- V25 Tab 分頁架構 ---
-        res_tab1, res_tab2, res_tab3, res_tab4 = st.tabs(["📊 投注價值與獲利", "🧠 智能裁決", "🎯 波膽分佈", "🎲 戰局模擬與雷達"])
+        # V26 Tab 架構
+        res_tab1, res_tab2, res_tab3, res_tab4 = st.tabs(["📊 價值與風險拆解", "🧠 智能裁決", "🎯 波膽分佈", "🎲 模擬與雷達"])
 
         candidates = []
 
-        # --- Tab 1: 價值分析 (含獲利計算) ---
+        # --- Tab 1: 價值分析 (V26 升級：EV 拆解) ---
         with res_tab1:
-            st.subheader("💰 獨贏 (1x2) 分析")
-            data_1x2 = []
+            st.subheader("💰 獨贏 (1x2) 深度分析")
+            
+            # 準備數據
+            rows_1x2 = []
             for tag, prob, key in [("主勝", prob_h, "home"), ("和局", prob_d, "draw"), ("客勝", prob_a, "away")]:
                 odd = engine.market["1x2_odds"][key]
-                ev = (prob * odd - 1) * 100 + market_bonus[key]
-                # V25: 獲利計算
+                total_ev = (prob * odd - 1) * 100 + market_bonus[key]
                 profit = (odd - 1) * unit_stake
-                data_1x2.append([tag, f"{prob*100:.1f}%", odd, f"{ev:+.1f}%", f"${profit:.1f}"])
-                if ev > 1.5:
-                    candidates.append({"type":"1x2", "pick":tag, "ev":ev, "odds":odd, "prob":prob})
+                
+                # V26: EV Source Attribution
+                implied_prob = 1.0 / odd
+                raw_edge = (prob - implied_prob) * 100 # 模型純優勢
+                leverage = total_ev - raw_edge         # 賠率槓桿 + 市場加成
+                
+                # V26: Sensitivity Check
+                sens_level, sens_desc = engine.check_sensitivity(lh, la, tag, total_ev)
+                
+                # 標籤邏輯
+                label = ""
+                if total_ev > 3 and sens_level == "Low": label = "💎 價值單"
+                elif total_ev > 10 and sens_level == "High": label = "⚠️ 虛高(脆弱)"
+                elif raw_edge < 0 and total_ev > 0: label = "🧨 僅靠賠率"
+                
+                rows_1x2.append({
+                    "選項": tag,
+                    "賠率": odd,
+                    "模型機率": f"{prob*100:.1f}%",
+                    "總 EV": f"{total_ev:+.1f}%",
+                    "EV 來源 (優勢 | 槓桿)": f"{raw_edge:+.1f}% | {leverage:+.1f}%",
+                    "壓力測試": sens_desc,
+                    "標籤": label
+                })
+                
+                if total_ev > 1.5:
+                    candidates.append({"type":"1x2", "pick":tag, "ev":total_ev, "odds":odd, "prob":prob, "sens": sens_level})
             
-            st.table(pd.DataFrame(data_1x2, columns=["選項", "模型機率", "賠率", "EV", "預計獲利"]))
+            st.dataframe(pd.DataFrame(rows_1x2), use_container_width=True)
 
-            col_ah, col_ou = st.columns(2)
-            with col_ah:
-                st.subheader("🛡️ 亞盤 (Handicap)")
-                data_ah = []
+            # 亞盤與大小球 (簡化顯示，邏輯同上)
+            c_ah, c_ou = st.columns(2)
+            with c_ah:
+                st.subheader("🛡️ 亞盤")
+                d_ah = []
                 for hcap in engine.market["handicaps"]:
                     ev = engine.ah_ev(M, hcap, engine.market["target_odds"]) + market_bonus["home"]
-                    profit = (engine.market["target_odds"] - 1) * unit_stake
-                    data_ah.append([f"主 {hcap:+}", f"{ev:+.1f}%", f"${profit:.1f}"])
-                    if ev > 2:
-                        candidates.append({"type":"AH", "pick":f"主 {hcap:+}", "ev":ev, "odds":engine.market["target_odds"], "prob":0.5+ev/200})
-                st.table(pd.DataFrame(data_ah, columns=["盤口", "EV", "預計獲利"]))
-
-            with col_ou:
-                st.subheader("📐 大小球 (Over/Under)")
-                data_ou = []
+                    profit = (engine.market["target_odds"]-1)*unit_stake
+                    d_ah.append([f"主 {hcap:+}", f"{ev:+.1f}%", f"${profit:.1f}"])
+                    if ev > 2: candidates.append({"type":"AH", "pick":f"主 {hcap:+}", "ev":ev, "odds":engine.market["target_odds"], "prob":0.5+ev/200, "sens":"Medium"})
+                st.table(pd.DataFrame(d_ah, columns=["盤口", "EV", "獲利"]))
+            
+            with c_ou:
+                st.subheader("📐 大小球")
+                d_ou = []
                 for line in engine.market["goal_lines"]:
-                    o_prob = sum(M[i,j] for i in range(9) for j in range(9) if i+j>line)
-                    ev_o = (o_prob * engine.market["target_odds"] - 1) * 100
-                    profit = (engine.market["target_odds"] - 1) * unit_stake
-                    data_ou.append([f"大 {line}", f"{o_prob*100:.1f}%", f"{ev_o:+.1f}%", f"${profit:.1f}"])
-                    if ev_o > 2:
-                        candidates.append({"type":"OU", "pick":f"大 {line}", "ev":ev_o, "odds":engine.market["target_odds"], "prob":o_prob})
-                st.table(pd.DataFrame(data_ou, columns=["盤口", "機率", "EV", "預計獲利"]))
+                    op = sum(M[i,j] for i in range(9) for j in range(9) if i+j>line)
+                    ev = (op * engine.market["target_odds"] - 1) * 100
+                    profit = (engine.market["target_odds"]-1)*unit_stake
+                    d_ou.append([f"大 {line}", f"{op*100:.1f}%", f"{ev:+.1f}%", f"${profit:.1f}"])
+                    if ev > 2: candidates.append({"type":"OU", "pick":f"大 {line}", "ev":ev, "odds":engine.market["target_odds"], "prob":op, "sens":"Medium"})
+                st.table(pd.DataFrame(d_ou, columns=["盤口", "機率", "EV", "獲利"]))
 
-            st.subheader("📝 最佳投資組合 (Top Picks)")
+            # 最佳推薦 (含棄單邏輯)
+            st.subheader("📝 智能投資決策 (Top Picks)")
             if candidates:
-                final_list = sorted(candidates, key=lambda x:x["ev"], reverse=True)
-                reco_data = []
-                for p in final_list[:3]:
-                    kelly = calc_kelly(p["prob"], p["odds"], kelly_frac)
-                    profit = (p['odds'] - 1) * unit_stake
-                    reco_data.append([f"[{p['type']}] {p['pick']}", p['odds'], f"{p['ev']:+.1f}%", f"{kelly:.1f}%", f"${profit:.1f}"])
-                st.dataframe(pd.DataFrame(reco_data, columns=["選項", "賠率", "EV", "建議注碼%", "預計獲利"]), use_container_width=True)
-                st.caption(f"* 預計獲利基於本金 ${unit_stake} 計算")
-            else:
-                st.info("無高 EV 選項推薦")
-
-        # --- Tab 2: 智能裁決 ---
-        with res_tab2:
-            st.subheader("🧠 模型裁決與警報")
-            total_xg = lh + la
-            if total_xg > 3.5: st.warning(f"🟠 高變異節奏 (Total xG: {total_xg:.2f}) - 攻防轉換快，紅牌點球影響大。")
-            elif total_xg > 2.5: st.success(f"🟢 中性節奏 (Total xG: {total_xg:.2f}) - 模型穩定性佳。")
-            else: st.info(f"🔵 低節奏 (Total xG: {total_xg:.2f}) - 爆冷多來自定位球。")
-
-            if candidates:
-                top_pick = sorted(candidates, key=lambda x:x["ev"], reverse=True)[0]
-                market_implied = 1.0 / top_pick['odds']
-                model_prob = top_pick['prob']
-                edge_diff = model_prob - market_implied
+                final = sorted(candidates, key=lambda x:x["ev"], reverse=True)[:3]
                 
-                st.markdown("---")
-                st.write(f"**最佳選項 [{top_pick['pick']}] 深度檢核：**")
-                c1, c2 = st.columns(2)
-                c1.metric("模型機率", f"{model_prob*100:.1f}%")
-                c2.metric("市場隱含", f"{market_implied*100:.1f}%")
+                # V26: No Bet Logic
+                no_bet_flag = False
+                no_bet_reason = []
+                
+                top = final[0]
+                if top['sens'] == "High" and top['ev'] < 15:
+                    no_bet_flag = True
+                    no_bet_reason.append("首選注單對運氣波動過於敏感 (Fragile Edge)")
+                
+                if len(final) >= 2:
+                    p1, p2 = final[0], final[1]
+                    def gdir(n):
+                        if "主" in n: return "HOME"
+                        if "客" in n: return "AWAY"
+                        return "NONE"
+                    if gdir(p1['pick']) != "NONE" and gdir(p1['pick']) == gdir(p2['pick']):
+                        no_bet_reason.append("前兩名選項方向重疊，風險過度集中")
 
-                if edge_diff < 0: st.error("🔴 虛高風險 (High Odds Trap)：EV 來自高賠率槓桿，實際勝率低。建議減半注碼。")
-                elif edge_diff < 0.03: st.warning("🟠 邊際優勢 (Thin Edge)：優勢不明顯，嚴格遵守注碼，不追單。")
-                else: st.success("🟢 真實價值 (True Value)：發現顯著機率偏差，信心買入。")
+                if no_bet_flag:
+                    st.error(f"🛑 系統建議觀望 (NO BET)")
+                    for r in no_bet_reason: st.write(f"- {r}")
+                else:
+                    reco = []
+                    for p in final:
+                        k = calc_kelly(p["prob"], p["odds"], kelly_frac)
+                        prof = (p["odds"]-1)*unit_stake
+                        sens_icon = "🟢" if p['sens']=="Low" else ("🟡" if p['sens']=="Medium" else "🔴")
+                        reco.append([f"[{p['type']}] {p['pick']}", p['odds'], f"{p['ev']:+.1f}%", f"{sens_icon} {p['sens']}", f"{k:.1f}%", f"${prof:.1f}"])
+                    st.dataframe(pd.DataFrame(reco, columns=["選項", "賠率", "EV", "穩健度", "注碼%", "獲利"]), use_container_width=True)
+            else:
+                st.info("無適合注單")
+
+        # --- Tab 2, 3, 4 (維持 V25 架構) ---
+        with res_tab2:
+            st.subheader("🧠 模型裁決")
+            total_xg = lh + la
+            if total_xg > 3.5: st.warning(f"🟠 高變異節奏 (xG {total_xg:.2f})")
+            elif total_xg > 2.5: st.success(f"🟢 中性節奏 (xG {total_xg:.2f})")
+            else: st.info(f"🔵 低節奏 (xG {total_xg:.2f})")
             
-            if len(candidates) >= 2:
-                final_list = sorted(candidates, key=lambda x:x["ev"], reverse=True)
-                p1 = final_list[0]; p2 = final_list[1]
-                def get_dir(n):
-                    if "主" in n: return "HOME"
-                    if "客" in n: return "AWAY"
-                    if "大" in n: return "OVER"
-                    return "NONE"
-                if get_dir(p1['pick']) != "NONE" and get_dir(p1['pick']) == get_dir(p2['pick']):
-                    st.error(f"⚠️ 資金控管警報：Top 1 與 Top 2 方向重疊！建議分攤注碼。")
+            if candidates:
+                top = sorted(candidates, key=lambda x:x["ev"], reverse=True)[0]
+                imp = 1.0/top['odds']
+                diff = top['prob'] - imp
+                col_c1, col_c2 = st.columns(2)
+                col_c1.metric("模型機率", f"{top['prob']*100:.1f}%")
+                col_c2.metric("市場隱含", f"{imp*100:.1f}%")
+                if diff < 0: st.error("🔴 虛高風險：EV 來自賠率槓桿")
+                elif diff < 0.03: st.warning("🟠 邊際優勢：優勢不明顯")
+                else: st.success("🟢 真實價值：顯著機率偏差")
 
-        # --- Tab 3: 波膽 ---
         with res_tab3:
-            st.subheader("🎯 波膽 (Correct Score) 熱力圖")
-            df_cs = pd.DataFrame(M[:6, :6], columns=[f"客 {j}" for j in range(6)], index=[f"主 {i}" for i in range(6)])
+            st.subheader("🎯 波膽分佈")
+            df_cs = pd.DataFrame(M[:6,:6], columns=[f"客{j}" for j in range(6)], index=[f"主{i}" for i in range(6)])
             st.dataframe(df_cs.style.format("{:.1%}", subset=None).background_gradient(cmap="Blues", axis=None))
-            st.write("**高價值波膽推薦：**")
-            for s, odd in engine.market["cs_odds"].items():
-                try:
-                    i, j = map(int, s.split(":"))
-                    prob = M[i, j]
-                    ev = (prob * odd - 1) * 100
-                    if ev > 10:
-                        profit = (odd - 1) * unit_stake
-                        st.write(f"- **{s}** @ {odd} (機率 {prob*100:.1f}%, EV {ev:+.1f}%) -> 獲利: ${profit:.1f}")
-                except: pass
 
-        # --- V25 Tab 4: 模擬與雷達 ---
         with res_tab4:
-            st.subheader("🎲 蒙地卡羅模擬 (5,000 場預演)")
-            sim_h, sim_a, sim_res = engine.run_monte_carlo(lh, la)
-            
-            wh = sim_res.count("home") / 5000
-            wd = sim_res.count("draw") / 5000
-            wa = sim_res.count("away") / 5000
-            
+            st.subheader("🎲 戰局模擬")
+            sh, sa, sr = engine.run_monte_carlo(lh, la)
             sc1, sc2, sc3 = st.columns(3)
-            sc1.metric("模擬主勝率", f"{wh:.1%}")
-            sc2.metric("模擬和局率", f"{wd:.1%}")
-            sc3.metric("模擬客勝率", f"{wa:.1%}")
+            sc1.metric("主勝率", f"{sr.count('home')/50:.1f}%")
+            sc2.metric("和局率", f"{sr.count('draw')/50:.1f}%")
+            sc3.metric("客勝率", f"{sr.count('away')/50:.1f}%")
             
-            st.write("**進球數機率分佈 (Histogram)**")
-            fig, ax = plt.subplots(figsize=(10, 4))
-            counts_h, bins_h = np.histogram(sim_h, bins=range(10), density=True)
-            ax.bar(bins_h[:-1]-0.15, counts_h, width=0.3, color='#1f77b4', alpha=0.7, label='Home Goals')
-            counts_a, bins_a = np.histogram(sim_a, bins=range(10), density=True)
-            ax.bar(bins_a[:-1]+0.15, counts_a, width=0.3, color='#ff7f0e', alpha=0.7, label='Away Goals')
-            ax.set_xticks(range(9))
-            ax.legend()
-            ax.grid(axis='y', alpha=0.3)
-            st.pyplot(fig)
-            st.info("💡 藍柱: 主隊進球機率 | 橘柱: 客隊進球機率。重疊越高代表平局或小球機率越大。")
-
+            fig, ax = plt.subplots(figsize=(10,4))
+            ch, bh = np.histogram(sh, bins=range(10), density=True)
+            ca, ba = np.histogram(sa, bins=range(10), density=True)
+            ax.bar(bh[:-1]-0.15, ch, width=0.3, color='#1f77b4', alpha=0.7, label='Home')
+            ax.bar(ba[:-1]+0.15, ca, width=0.3, color='#ff7f0e', alpha=0.7, label='Away')
+            ax.legend(); st.pyplot(fig)
+            
             st.divider()
-            st.subheader("⚔️ 綜合戰力雷達圖")
-            categories = ['Attack', 'Defense', 'Form', 'Home/Away', 'Motivation']
+            st.subheader("⚔️ 戰力雷達")
+            cats = ['Attack', 'Defense', 'Form', 'Home/Away', 'Motivation']
+            def get_s(stats):
+                return [min(10, stats["offensive_stats"]["xg_avg"]*4), min(10, (3-stats["defensive_stats"]["xga_avg"])*3.5), sum(stats["context_modifiers"]["recent_form_trend"])*2, stats["general_strength"]["home_advantage_weight"]*5, 8 if stats["context_modifiers"]["motivation"]!="normal" else 5]
             
-            def get_score(stats, is_home):
-                att = min(10, stats["offensive_stats"]["xg_avg"] * 4)
-                deff = min(10, (3 - stats["defensive_stats"]["xga_avg"]) * 3.5)
-                form = sum(stats["context_modifiers"]["recent_form_trend"]) * 2
-                adv = stats["general_strength"]["home_advantage_weight"] * 5
-                motiv = 8 if stats["context_modifiers"]["motivation"] != "normal" else 5
-                return [att, deff, form, adv, motiv]
-
-            h_scores = get_score(engine.h, True)
-            a_scores = get_score(engine.a, False)
-            
-            N = len(categories)
-            angles = [n / float(N) * 2 * math.pi for n in range(N)]
-            angles += angles[:1]
-            h_scores += h_scores[:1]
-            a_scores += a_scores[:1]
-            
-            fig_radar, ax_radar = plt.subplots(figsize=(6, 6), subplot_kw=dict(polar=True))
-            ax_radar.plot(angles, h_scores, linewidth=2, linestyle='solid', label='Home', color='#1f77b4')
-            ax_radar.fill(angles, h_scores, '#1f77b4', alpha=0.2)
-            ax_radar.plot(angles, a_scores, linewidth=2, linestyle='solid', label='Away', color='#ff7f0e')
-            ax_radar.fill(angles, a_scores, '#ff7f0e', alpha=0.2)
-            ax_radar.set_xticks(angles[:-1])
-            ax_radar.set_xticklabels(categories)
-            ax_radar.legend(loc='upper right', bbox_to_anchor=(0.1, 0.1))
-            st.pyplot(fig_radar)
+            hs, ans = get_s(engine.h), get_s(engine.a)
+            N = len(cats); ang = [n/float(N)*2*math.pi for n in range(N)]; ang+=ang[:1]; hs+=hs[:1]; ans+=ans[:1]
+            figr, axr = plt.subplots(figsize=(6,6), subplot_kw=dict(polar=True))
+            axr.plot(ang, hs, color='#1f77b4', label='Home'); axr.fill(ang, hs, '#1f77b4', alpha=0.2)
+            axr.plot(ang, ans, color='#ff7f0e', label='Away'); axr.fill(ang, ans, '#ff7f0e', alpha=0.2)
+            axr.set_xticks(ang[:-1]); axr.set_xticklabels(cats); axr.legend()
+            st.pyplot(figr)
