@@ -7,15 +7,17 @@ import matplotlib.pyplot as plt
 from typing import Dict, List, Tuple, Any, Optional
 
 # =========================
-# 1. 核心數學工具 (Math Utils)
+# 1. 核心數學工具 (Math Utils - 數值穩定版)
 # =========================
 
 def poisson_pmf(k: int, lam: float) -> float:
-    """計算卜瓦松分佈機率質量函數"""
-    return math.exp(-lam) * lam**k / math.factorial(k)
+    """[V32.0] 使用 lgamma 避免階乘溢位，提升大比分計算穩定性"""
+    if lam <= 0: return 1.0 if k == 0 else 0.0
+    # exp(-lam + k*ln(lam) - ln(k!))
+    return math.exp(-lam + k * math.log(lam) - math.lgamma(k + 1))
 
 def nb_pmf(k: int, mu: float, alpha: float) -> float:
-    """計算負二項分佈機率質量函數"""
+    """計算負二項分佈機率質量函數 (維持 lgamma)"""
     if alpha <= 0:
         return poisson_pmf(k, mu)
     r = 1.0 / alpha
@@ -25,14 +27,11 @@ def nb_pmf(k: int, mu: float, alpha: float) -> float:
 
 @st.cache_data
 def get_matrix_cached(lh: float, la: float, max_g: int, nb_alpha: float, vol_adjust: bool) -> np.ndarray:
-    """
-    快取矩陣計算結果，避免重複運算
-    """
+    """快取矩陣計算結果"""
     G = max_g
     i = np.arange(G)
     j = np.arange(G)
     
-    # 建立機率向量
     p_i = np.array([poisson_pmf(k, lh) for k in i])
     p_j = np.array([poisson_pmf(k, la) for k in j])
     Mp = np.outer(p_i, p_j)
@@ -41,10 +40,8 @@ def get_matrix_cached(lh: float, la: float, max_g: int, nb_alpha: float, vol_adj
     nb_j = np.array([nb_pmf(k, la, nb_alpha) for k in j])
     Mn = np.outer(nb_i, nb_j)
 
-    # 混合模型 (60% Poisson + 40% Negative Binomial)
     M = 0.6 * Mp + 0.4 * Mn
     
-    # 相關性修正 (Dixon-Coles 調整)
     rho = -0.18 if vol_adjust else -0.13
     
     if G > 1:
@@ -56,16 +53,14 @@ def get_matrix_cached(lh: float, la: float, max_g: int, nb_alpha: float, vol_adj
     return M / M.sum()
 
 def calc_risk_adj_kelly(ev_percent: float, variance: float, risk_scale: float = 0.5, prob: float = 0.5) -> float:
-    """計算風險調整後的凱利公式注碼"""
     if variance <= 0 or ev_percent <= 0: return 0.0
     ev = ev_percent / 100.0
     f = (ev / variance) * risk_scale
     cap = 0.5
-    if prob < 0.35: cap = 0.02 # 冷門保護機制
+    if prob < 0.35: cap = 0.02
     return min(cap, max(0.0, f)) * 100
 
 def calc_risk_metrics(prob: float, odds: float) -> Tuple[float, float]:
-    """計算變異數與夏普值"""
     if prob <= 0 or prob >= 1: return 0.0, 0.0
     win_payoff = odds - 1.0
     lose_payoff = -1.0
@@ -77,7 +72,6 @@ def calc_risk_metrics(prob: float, odds: float) -> Tuple[float, float]:
     return variance, sharpe
 
 def get_true_implied_prob(odds_dict: Dict[str, float]) -> Dict[str, float]:
-    """去除水錢，計算真實隱含機率"""
     inv = {}
     for k, v in odds_dict.items():
         try:
@@ -90,7 +84,7 @@ def get_true_implied_prob(odds_dict: Dict[str, float]) -> Dict[str, float]:
     return {k: inv[k] / margin for k in odds_dict}
 
 # =========================
-# 2. 全景記憶體系 (Regime Memory)
+# 2. 全景記憶體系
 # =========================
 class RegimeMemory:
     def __init__(self):
@@ -117,28 +111,22 @@ class RegimeMemory:
         is_underdog = prob_h < 0.35
         motiv_h = h["context_modifiers"]["motivation"]
         motiv_a = a["context_modifiers"]["motivation"]
-        
-        # 安全讀取近期狀態
         form_h_score = sum(h["context_modifiers"].get("recent_form_trend", [0]))
         form_a_score = sum(a["context_modifiers"].get("recent_form_trend", [0]))
-        
         is_title_race = (motiv_h == "title_race")
         is_relegation = (motiv_h == "survival" or motiv_a == "survival")
         
-        # 判定劇本
         if h_odds < 2.10 and form_h_score < -1: return "Fallen_Giant"
         if is_heavy_fav and form_h_score < 0: return "Injury_Crisis_Fav"
         if is_title_race and is_heavy_fav: return "Title_MustWin_Home"
         if is_relegation and is_underdog: return "Relegation_Dog"
         
-        # 安全讀取主場權重
         h_adv = h["general_strength"].get("home_advantage_weight", 1.15)
         if h_adv > 1.15 and h_odds < 2.0 and form_h_score >= 1: return "Fortress_Home"
         
         if is_underdog and form_h_score > (form_a_score + 2): return "Hidden_Gem_Dog"
         if h_odds < 1.30: return "MarketHype_Fav"
         if (lh + la) < 2.2 and abs(form_h_score) < 2 and abs(form_a_score) < 2: return "Bore_Draw_Stalemate"
-        
         return "MidTable_Standard"
 
     def recall_experience(self, regime_id: str) -> Dict:
@@ -152,7 +140,7 @@ class RegimeMemory:
         return 1.0
 
 # =========================
-# 3. 分析引擎邏輯 (Logic Core)
+# 3. 分析引擎邏輯 (Logic Core - V32.0 邏輯升級)
 # =========================
 class SniperAnalystLogic:
     def __init__(self, json_data: Any, max_g: int = 9, nb_alpha: float = 0.12):
@@ -166,12 +154,9 @@ class SniperAnalystLogic:
 
     def calc_lambda(self) -> Tuple[float, float]:
         league_base = 1.35
-        
         def att_def(team):
-            # 使用 .get() 並提供後備值，解決 KeyError
             xg = team["offensive_stats"].get("xg_avg", team["offensive_stats"]["goals_scored_avg"])
             xga = team["defensive_stats"].get("xga_avg", team["defensive_stats"]["goals_conceded_avg"])
-            
             att = 0.4 * team["offensive_stats"]["goals_scored_avg"] + 0.6 * xg
             deff = 0.4 * team["defensive_stats"]["goals_conceded_avg"] + 0.6 * xga
             return att, deff
@@ -189,7 +174,6 @@ class SniperAnalystLogic:
         
         if self.h["context_modifiers"]["motivation"] == "survival": lh *= 1.05
         if self.a["context_modifiers"]["motivation"] == "title_race": la *= 1.05
-        
         return lh, la
 
     def get_market_trend_bonus(self) -> Dict[str, float]:
@@ -198,7 +182,6 @@ class SniperAnalystLogic:
         cu = self.market.get("1x2_odds")
         if not op or not cu: return bonus
         for k in bonus:
-            # 簡單計算賠率下跌幅度作為加分
             drop = max(0.0, (op[k] - cu[k]) / op[k])
             bonus[k] = min(3.0, drop * 30.0)
         return bonus
@@ -209,42 +192,66 @@ class SniperAnalystLogic:
         return get_matrix_cached(lh, la, self.max_g, self.nb_alpha, vol_adjust)
 
     def ah_ev(self, M: np.ndarray, hcap: float, odds: float) -> float:
+        """
+        [V32.0 升級] 亞盤 Quarter Split (四分盤) 精確計算邏輯
+        """
+        # 1. 檢查是否為四分盤 (如 -0.75, +0.25)
+        # 0.75 * 4 = 3 (奇數), 0.5 * 4 = 2 (偶數)
+        q = int(round(hcap * 4))
+        
+        if q % 2 != 0:
+            # Quarter Split: 拆分成兩個盤口計算
+            # 例: -0.75 (q=-3) -> -0.5 (q=-2) 和 -1.0 (q=-4)
+            h1 = (q + 1) / 4.0
+            h2 = (q - 1) / 4.0
+            ev1 = self.ah_ev(M, h1, odds)
+            ev2 = self.ah_ev(M, h2, odds)
+            return 0.5 * ev1 + 0.5 * ev2
+        
+        # 2. 標準盤口 (整數盤或半球盤)
         G = self.max_g
-        # 向量化計算分差與派彩
         idx_diff = np.subtract.outer(np.arange(G), np.arange(G)) 
         r_matrix = idx_diff + hcap
         
-        # 向量化計算派彩結果 (1:贏, 0.5:贏半, 0:走盤, -0.5:輸半, -1:輸)
+        # 精確的派彩矩陣
         payoff = np.select(
-            [r_matrix > 0.25, np.abs(r_matrix - 0.25) < 1e-9, np.abs(r_matrix) < 1e-9, np.abs(r_matrix + 0.25) < 1e-9],
-            [odds - 1, (odds - 1) * 0.5, 0, -0.5],
+            [r_matrix > 0.001, np.abs(r_matrix) <= 0.001, r_matrix < -0.001],
+            [odds - 1, 0, -1], # 贏, 走盤, 輸
             default=-1
         )
+        
         ev = np.sum(M * payoff)
         return ev * 100
 
-    def run_monte_carlo(self, lh: float, la: float, sims: int = 10000, seed: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+    def run_monte_carlo(self, M: np.ndarray, sims: int = 10000, seed: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray, List[str]]:
         """
-        [V31.5 升級] 向量化蒙地卡羅模擬
-        - 預設次數提升至 10,000 次
-        - 使用 Numpy 向量運算取代 Python 迴圈，速度大幅提升
+        [V32.0 升級] 基於聯合分佈 (Joint Distribution) 的抽樣
+        - 確保模擬結果與波膽矩陣 M 完全一致
+        - 不再使用獨立 Poisson 抽樣，捕捉相關性修正
         """
         rng = np.random.default_rng(seed)
+        G = M.shape[0]
         
-        # 1. 批量生成數據 (Vectorized generation)
-        home_goals = rng.poisson(lh, sims)
-        away_goals = rng.poisson(la, sims)
+        # 1. 將矩陣攤平為機率向量
+        flat_M = M.flatten()
+        flat_M = flat_M / flat_M.sum() # 確保總和為 1
         
-        # 2. 向量化判斷勝負 (Vectorized comparison)
+        # 2. 從聯合分佈中抽取索引
+        indices = rng.choice(G * G, size=sims, p=flat_M)
+        
+        # 3. 還原為主客進球數
+        home_goals = indices // G
+        away_goals = indices % G
+        
+        # 4. 判斷勝負
         diff = home_goals - away_goals
-        results = np.full(sims, "draw", dtype=object) # 預設全為和局
-        results[diff > 0] = "home" # 主勝
-        results[diff < 0] = "away" # 客勝
+        results = np.full(sims, "draw", dtype=object)
+        results[diff > 0] = "home"
+        results[diff < 0] = "away"
         
         return home_goals, away_goals, results.tolist()
 
     def check_sensitivity(self, lh: float, la: float) -> Tuple[str, float]:
-        """壓力測試：當客隊 xG 增加 0.3 時，主勝率下降多少"""
         M_stress = get_matrix_cached(lh, la + 0.3, self.max_g, self.nb_alpha, False)
         M_orig = self.build_ensemble_matrix(lh, la)
         prob_h_orig = float(np.sum(np.tril(M_orig, -1)))
@@ -257,12 +264,15 @@ class SniperAnalystLogic:
         return level, drop_rate
 
     def calc_model_confidence(self, lh: float, la: float, market_diff_percent: float, sens_drop_rate: float) -> Tuple[float, List[str]]:
+        """[V32.0] 使用相對差異作為信心指標"""
         score = 1.0
         reasons = []
+        
+        # 門檻調整適應百分比差異
         if market_diff_percent > 0.25:
-            score *= 0.7; reasons.append("與市場差異過大 (>25%)")
+            score *= 0.7; reasons.append(f"與市場差異過大 ({market_diff_percent:.1%})")
         elif market_diff_percent > 0.15:
-            score *= 0.85; reasons.append("與市場顯著分歧")
+            score *= 0.85; reasons.append(f"與市場顯著分歧 ({market_diff_percent:.1%})")
         
         if sens_drop_rate > 0.15:
             score *= 0.8; reasons.append("模型對運氣球極度敏感")
@@ -276,18 +286,16 @@ class SniperAnalystLogic:
         return score, reasons
 
 # =========================
-# 4. Streamlit UI 介面 (UI Layer)
+# 4. Streamlit UI 介面 (V32.0)
 # =========================
-st.set_page_config(page_title="狙擊手分析 V31.5 MC10K", page_icon="⚽", layout="wide")
+st.set_page_config(page_title="狙擊手 V32.0 (邏輯修正版)", page_icon="⚽", layout="wide")
 
-st.title("⚽ 狙擊手 V31.5 (10,000次極速模擬版)")
-st.markdown("### 專業足球數據分析：向量化加速 x 狀態管理 x 大數據模擬")
+st.title("⚽ 狙擊手 V32.0 (邏輯修正版)")
+st.markdown("### 修正重點：AH四分盤分拆 / 聯合分佈MC抽樣 / Lgamma穩定性")
 
-# --- 初始化 Session State (狀態管理：防止切換 Tab 時數據消失) ---
 if "analysis_results" not in st.session_state:
     st.session_state.analysis_results = None
 
-# --- 側邊欄 ---
 with st.sidebar:
     st.header("⚙️ 參數設定")
     unit_stake = st.number_input("💰 設定單注本金 ($)", min_value=10, value=100, step=10)
@@ -300,7 +308,6 @@ with st.sidebar:
     seed_val = 42 if enable_fixed_seed else None
     use_mock_memory = st.checkbox("🧠 啟用歷史記憶 (真實回測數據)", value=True)
 
-# --- 輸入區 ---
 st.info("請選擇數據輸入方式：")
 tab_input1, tab_input2 = st.tabs(["📋 貼上 JSON 代碼", "📂 上傳 JSON 檔案"])
 input_data = None
@@ -343,27 +350,22 @@ with tab_input2:
         try: input_data = json.load(uploaded_file)
         except: st.error("檔案讀取失敗")
 
-# --- 執行分析 ---
 if st.button("🚀 開始全方位分析", type="primary"):
     if not input_data:
         st.error("請先輸入有效的比賽數據！")
     else:
-        # 防呆：確保欄位存在
         if "recent_form_trend" not in input_data["home"]["context_modifiers"]:
             input_data["home"]["context_modifiers"]["recent_form_trend"] = [0,0,0]
         if "recent_form_trend" not in input_data["away"]["context_modifiers"]:
             input_data["away"]["context_modifiers"]["recent_form_trend"] = [0,0,0]
 
-        # 初始化引擎
         engine = SniperAnalystLogic(input_data, max_g, nb_alpha)
         
-        # 1. 基礎計算
         lh, la = engine.calc_lambda()
         M = engine.build_ensemble_matrix(lh, la)
         market_bonus = engine.get_market_trend_bonus()
         true_imp_probs = get_true_implied_prob(engine.market["1x2_odds"])
         
-        # 2. 全景記憶識別
         regime_id = engine.memory.analyze_scenario(engine, lh, la)
         history_data = {"name": "未知", "bets": 0, "roi": 0.0}
         memory_penalty = 1.0
@@ -372,13 +374,14 @@ if st.button("🚀 開始全方位分析", type="primary"):
             history_data = engine.memory.recall_experience(regime_id)
             memory_penalty = engine.memory.calc_memory_penalty(history_data["roi"])
 
-        # 3. 信心分數
+        # [V32.0] 相對差異計算
         prob_h = float(np.sum(np.tril(M, -1)))
-        diff_h = max(0, prob_h - true_imp_probs["home"])
-        sens_level, sens_drop = engine.check_sensitivity(lh, la)
-        model_conf_score, conf_reasons = engine.calc_model_confidence(lh, la, diff_h, sens_drop)
+        market_prob_h = true_imp_probs.get("home", 1e-9)
+        market_diff_percent = abs(prob_h - market_prob_h) / max(market_prob_h, 1e-9)
         
-        # 將計算結果存入 Session State (關鍵優化：鎖定結果)
+        sens_level, sens_drop = engine.check_sensitivity(lh, la)
+        model_conf_score, conf_reasons = engine.calc_model_confidence(lh, la, market_diff_percent, sens_drop)
+        
         st.session_state.analysis_results = {
             "engine": engine,
             "M": M,
@@ -392,14 +395,12 @@ if st.button("🚀 開始全方位分析", type="primary"):
             "prob_h": prob_h
         }
 
-# --- 結果顯示區 (從 Session State 讀取，避免重算) ---
 if st.session_state.analysis_results:
     res = st.session_state.analysis_results
     engine = res["engine"]
     M = res["M"]
     history_data = res["history_data"]
     
-    # 側邊欄資訊
     with st.sidebar:
         st.divider()
         st.subheader("🧠 盤口劇本識別")
@@ -419,7 +420,6 @@ if st.session_state.analysis_results:
         st.subheader("🛡️ 模型信心")
         st.metric("Confidence", f"{res['model_conf_score']*100:.0f}/100")
 
-    # 主畫面 Header
     col1, col2, col3 = st.columns([1, 0.2, 1])
     with col1:
         st.markdown(f"<h3 style='text-align: right; color: #1f77b4;'>{engine.h['name']}</h3>", unsafe_allow_html=True)
@@ -471,7 +471,7 @@ if st.session_state.analysis_results:
 
         c_ah, c_ou = st.columns(2)
         with c_ah:
-            st.subheader("🛡️ 亞盤")
+            st.subheader("🛡️ 亞盤 (Split計算)")
             d_ah = []
             target_o = engine.market.get("target_odds", 1.90)
             
@@ -509,7 +509,6 @@ if st.session_state.analysis_results:
                 prob_over = float(M[idx_sum > line].sum())
                 prob_under = float(M[idx_sum < line].sum())
                 
-                # 雙向檢查
                 for side_label, op, pick_name in [("大", prob_over, f"大 {line}"), ("小", prob_under, f"小 {line}")]:
                     raw_ev = (op * target_o - 1) * 100
                     adj_ev = raw_ev * res["model_conf_score"] * res["memory_penalty"]
@@ -590,17 +589,18 @@ if st.session_state.analysis_results:
             else: st.success("🟢 真實價值：顯著機率偏差")
 
     with res_tab3:
-        st.subheader("🎯 波膽分佈 (流暢優化版)")
+        st.subheader("🎯 波膽分佈")
         disp_g = min(6, engine.max_g)
         df_cs = pd.DataFrame(M[:disp_g,:disp_g], columns=[f"客{j}" for j in range(disp_g)], index=[f"主{i}" for i in range(disp_g)])
         st.dataframe(df_cs.style.format("{:.1%}", subset=None))
 
     with res_tab4:
-        st.subheader("🎲 戰局模擬 (10,000次極速版)")
+        st.subheader("🎲 戰局模擬 (MC Joint-Sampling)")
         
-        # 
         
-        sh, sa, sr = engine.run_monte_carlo(res["lh"], res["la"], sims=10000, seed=seed_val)
+        
+        # [V32.0] 使用 Joint-M Sampling
+        sh, sa, sr = engine.run_monte_carlo(res["M"], sims=10000, seed=seed_val)
         
         sim_count = len(sr)
         sc1, sc2, sc3 = st.columns(3)
