@@ -6,10 +6,9 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 # =========================
-# 1. 核心數學工具 (移除微函數 Cache，保留矩陣 Cache)
+# 1. 核心數學工具
 # =========================
 
-# V31.2: 移除 @st.cache_data，純數學計算直接執行更快
 def poisson_pmf(k, lam):
     return math.exp(-lam) * lam**k / math.factorial(k)
 
@@ -21,7 +20,7 @@ def nb_pmf(k, mu, alpha):
     coeff = math.exp(math.lgamma(k + r) - math.lgamma(r) - math.lgamma(k + 1))
     return float(coeff * (p ** r) * ((1 - p) ** k))
 
-# V31.1: 向量化加速矩陣建構 (保留 Cache，這是效能瓶頸所在)
+# 向量化加速矩陣建構
 @st.cache_data
 def get_matrix_cached(lh, la, max_g, nb_alpha, vol_adjust):
     G = max_g
@@ -57,7 +56,6 @@ def calc_risk_adj_kelly(ev_percent, variance, risk_scale=0.5, prob=0.5):
     ev = ev_percent / 100.0
     f = (ev / variance) * risk_scale
     cap = 0.5
-    # 冷門股安全閥
     if prob < 0.35: cap = 0.02
     return min(cap, max(0.0, f)) * 100
 
@@ -72,7 +70,6 @@ def calc_risk_metrics(prob, odds):
     sharpe = expected_val / std_dev if std_dev > 0 else 0
     return variance, sharpe
 
-# 穩健版去水錢
 def get_true_implied_prob(odds_dict):
     inv = {}
     for k, v in odds_dict.items():
@@ -86,7 +83,7 @@ def get_true_implied_prob(odds_dict):
     return {k: inv[k] / margin for k in odds_dict}
 
 # =========================
-# 2. 全景記憶體系 (V30.1 數據)
+# 2. 全景記憶體系
 # =========================
 class RegimeMemory:
     def __init__(self):
@@ -154,15 +151,18 @@ class SniperAnalystLogic:
     def calc_lambda(self):
         league_base = 1.35
         def att_def(team):
-            att = 0.4*team["offensive_stats"]["goals_scored_avg"] + 0.6*team["offensive_stats"]["xg_avg"]
-            deff = 0.4*team["defensive_stats"]["goals_conceded_avg"] + 0.6*team["defensive_stats"]["xga_avg"]
+            att = 0.4*team["offensive_stats"]["goals_scored_avg"] + 0.6*team["offensive_stats"].get("xg_avg", team["offensive_stats"]["goals_scored_avg"])
+            deff = 0.4*team["defensive_stats"]["goals_conceded_avg"] + 0.6*team["defensive_stats"].get("xga_avg", team["defensive_stats"]["goals_conceded_avg"])
             return att, deff
 
         h_att, h_def = att_def(self.h)
         a_att, a_def = att_def(self.a)
         if self.h["context_modifiers"]["missing_key_defender"]: h_def *= 1.20
         if self.a["context_modifiers"]["missing_key_defender"]: a_def *= 1.15
-        h_adv = self.h["general_strength"]["home_advantage_weight"]
+        
+        # 安全讀取主場優勢
+        h_adv = self.h["general_strength"].get("home_advantage_weight", 1.15)
+        
         lh = (h_att * a_def / league_base) * h_adv
         la = (a_att * h_def / league_base)
         if self.h["context_modifiers"]["motivation"] == "survival": lh *= 1.05
@@ -180,7 +180,9 @@ class SniperAnalystLogic:
         return bonus
 
     def build_ensemble_matrix(self, lh, la):
-        vol_adjust = self.h["style_of_play"]["volatility"]=="high"
+        # 安全讀取 volatility
+        vol_str = self.h.get("style_of_play", {}).get("volatility", "normal")
+        vol_adjust = (vol_str == "high")
         return get_matrix_cached(lh, la, self.max_g, self.nb_alpha, vol_adjust)
 
     def ah_ev(self, M, hcap, odds):
@@ -196,7 +198,6 @@ class SniperAnalystLogic:
         ev = np.sum(M * payoff)
         return ev * 100
 
-    # V31.2: 支援 Seed 參數，實現可控隨機性
     def run_monte_carlo(self, lh, la, sims=5000, seed=None):
         rng = np.random.default_rng(seed)
         home_goals = rng.poisson(lh, sims)
@@ -238,9 +239,9 @@ class SniperAnalystLogic:
 # =========================
 # 4. Streamlit UI 介面
 # =========================
-st.set_page_config(page_title="狙擊手分析 V31.3 UI", page_icon="⚽", layout="wide")
+st.set_page_config(page_title="狙擊手分析 V31.3 Fix", page_icon="⚽", layout="wide")
 
-st.title("⚽ 狙擊手 V31.3 修復版")
+st.title("⚽ 狙擊手 V31.3 (雙向大小球修復版)")
 st.markdown("### 專業足球數據分析：向量化加速 x 隨機性控制 x 數據一致性")
 
 # --- 側邊欄 ---
@@ -252,10 +253,8 @@ with st.sidebar:
     max_g = st.number_input("運算範圍 (max_g)", 5, 20, 9)
     risk_scale = st.slider("風險縮放係數", 0.1, 1.0, 0.3, 0.1)
     st.divider()
-    # V31.2: 隨機數種子控制
     enable_fixed_seed = st.toggle("固定隨機數種子 (除錯/回測用)", value=True)
     seed_val = 42 if enable_fixed_seed else None
-    
     use_mock_memory = st.checkbox("🧠 啟用歷史記憶 (真實回測數據)", value=True)
 
 # --- 輸入區 ---
@@ -263,32 +262,30 @@ st.info("請選擇數據輸入方式：")
 tab1, tab2 = st.tabs(["📋 貼上 JSON 代碼", "📂 上傳 JSON 檔案"])
 input_data = None
 
-# 使用上次的數據作為預設
 default_json = """{
-  "meta_info": { "league_name": "澳洲甲級聯賽", "match_date": "2026-03-11" },
+  "meta_info": { "league_name": "範例聯賽", "match_date": "2026-03-11" },
   "market_data": {
     "handicaps": [-0.75, 0.25],
-    "goal_lines": [3.0, 3.25],
+    "goal_lines": [2.5, 3.0],
     "target_odds": 1.90,
     "1x2_odds": { "home": 1.72, "draw": 4.00, "away": 4.00 },
-    "opening_odds": { "home": 3.20, "draw": 3.60, "away": 2.20 },
-    "cs_odds": { "1:0": 7.5, "2:0": 8.0, "2:1": 7.5, "1:1": 7.0 }
+    "opening_odds": { "home": 3.20, "draw": 3.60, "away": 2.20 }
   },
   "home": {
-    "name": "悉尼FC",
+    "name": "主隊範例",
     "general_strength": { "home_advantage_weight": 1.25 },
     "offensive_stats": { "goals_scored_avg": 1.57, "xg_avg": 1.6 },
     "defensive_stats": { "goals_conceded_avg": 1.0, "xga_avg": 0.95 },
     "style_of_play": { "volatility": "normal" },
-    "context_modifiers": { "motivation": "title_race", "missing_key_defender": false, "recent_form_trend": [1, 0, -1, 1, 0] }
+    "context_modifiers": { "motivation": "title_race", "missing_key_defender": false, "recent_form_trend": [1, 0, -1] }
   },
   "away": {
-    "name": "西悉尼流浪者",
+    "name": "客隊範例",
     "general_strength": { "home_advantage_weight": 0.80 },
     "offensive_stats": { "goals_scored_avg": 0.80, "xg_avg": 0.9 },
     "defensive_stats": { "goals_conceded_avg": 1.33, "xga_avg": 1.5 },
     "style_of_play": { "volatility": "high" },
-    "context_modifiers": { "motivation": "survival", "missing_key_defender": true, "recent_form_trend": [-1, 1, -1, 0, -1] }
+    "context_modifiers": { "motivation": "survival", "missing_key_defender": true, "recent_form_trend": [-1, 1, -1] }
   }
 }"""
 
@@ -308,6 +305,7 @@ if st.button("🚀 開始全方位分析", type="primary"):
     if not input_data:
         st.error("請先輸入有效的比賽數據！")
     else:
+        # 防呆：確保欄位存在
         if "recent_form_trend" not in input_data["home"]["context_modifiers"]:
             input_data["home"]["context_modifiers"]["recent_form_trend"] = [0,0,0]
         if "recent_form_trend" not in input_data["away"]["context_modifiers"]:
@@ -319,8 +317,6 @@ if st.button("🚀 開始全方位分析", type="primary"):
         lh, la = engine.calc_lambda()
         M = engine.build_ensemble_matrix(lh, la)
         market_bonus = engine.get_market_trend_bonus()
-        
-        # V31: 去水錢
         true_imp_probs = get_true_implied_prob(engine.market["1x2_odds"])
         
         # 2. 全景記憶識別
@@ -332,10 +328,9 @@ if st.button("🚀 開始全方位分析", type="primary"):
             history_data = engine.memory.recall_experience(regime_id)
             memory_penalty = engine.memory.calc_memory_penalty(history_data["roi"])
 
-        # 3. 信心分數 (V31.2: 統一使用去水機率做比較)
+        # 3. 信心分數
         prob_h = float(np.sum(np.tril(M,-1)))
         diff_h = max(0, prob_h - true_imp_probs["home"])
-        
         sens_level, sens_drop = engine.check_sensitivity(lh, la)
         model_conf_score, conf_reasons = engine.calc_model_confidence(lh, la, diff_h, sens_drop)
         
@@ -376,7 +371,7 @@ if st.button("🚀 開始全方位分析", type="primary"):
         candidates = []
 
         with res_tab1:
-            st.subheader("💰 獨贏 (1x2) - V31.2 優化版")
+            st.subheader("💰 獨贏 (1x2)")
             rows_1x2 = []
             for tag, prob, key in [("主勝", prob_h, "home"), ("和局", prob_d, "draw"), ("客勝", prob_a, "away")]:
                 odd = engine.market["1x2_odds"][key]
@@ -411,11 +406,13 @@ if st.button("🚀 開始全方位分析", type="primary"):
             with c_ah:
                 st.subheader("🛡️ 亞盤")
                 d_ah = []
+                # 安全讀取 target_odds
+                target_o = engine.market.get("target_odds", 1.90)
+                
                 for hcap in engine.market["handicaps"]:
-                    raw_ev = engine.ah_ev(M, hcap, engine.market["target_odds"]) + market_bonus["home"]
+                    raw_ev = engine.ah_ev(M, hcap, target_o) + market_bonus["home"]
                     adj_ev = raw_ev * model_conf_score * memory_penalty
                     
-                    target_o = engine.market["target_odds"]
                     prob_approx = (raw_ev/100.0 + 1) / target_o
                     var, sharpe = calc_risk_metrics(prob_approx, target_o)
                     kelly_pct = calc_risk_adj_kelly(adj_ev, var, risk_scale, prob_approx)
@@ -434,34 +431,48 @@ if st.button("🚀 開始全方位分析", type="primary"):
                         })
                 st.dataframe(pd.DataFrame(d_ah), use_container_width=True)
             
+            # ===== 修正點：大小球雙向推薦邏輯 =====
             with c_ou:
-                st.subheader("📐 大小球")
+                st.subheader("📐 大小球 (雙向)")
                 d_ou = []
-                for line in engine.market["goal_lines"]:
-                    G = engine.max_g
-                    idx_sum = np.add.outer(np.arange(G), np.arange(G))
-                    op = float(M[idx_sum > line].sum())
-                    
-                    raw_ev = (op * engine.market["target_odds"] - 1) * 100
-                    adj_ev = raw_ev * model_conf_score * memory_penalty
-                    
-                    target_o = engine.market["target_odds"]
-                    var, sharpe = calc_risk_metrics(op, target_o)
-                    kelly_pct = calc_risk_adj_kelly(adj_ev, var, risk_scale, op)
-                    profit = (target_o - 1) * unit_stake
+                
+                # 優化：矩陣索引只算一次
+                G = engine.max_g
+                idx_sum = np.add.outer(np.arange(G), np.arange(G))
+                target_o = engine.market.get("target_odds", 1.90)
 
-                    d_ou.append({
-                        "盤口": f"大 {line}", "賠率": target_o, 
-                        "修正 EV": f"{adj_ev:+.1f}%", "預計獲利": f"${profit:.1f}",
-                        "夏普值": f"{sharpe:.2f}", "建議注碼%": f"{kelly_pct:.1f}%"
-                    })
-                    if adj_ev > 2: 
-                        candidates.append({
-                            "type":"OU", "pick":f"大 {line}", "ev":adj_ev, "raw_ev":raw_ev,
-                            "odds":target_o, "prob":op, "sens":"Medium",
-                            "sharpe": sharpe, "kelly": kelly_pct, "note": ""
+                for line in engine.market["goal_lines"]:
+                    # 1. 分別計算 [大] 與 [小] 的機率
+                    prob_over = float(M[idx_sum > line].sum())
+                    prob_under = float(M[idx_sum < line].sum())
+                    
+                    # 2. 雙向迴圈：同時評估 [大] 與 [小]
+                    for side_label, op, pick_name in [("大", prob_over, f"大 {line}"), ("小", prob_under, f"小 {line}")]:
+                        
+                        raw_ev = (op * target_o - 1) * 100
+                        adj_ev = raw_ev * model_conf_score * memory_penalty
+                        
+                        var, sharpe = calc_risk_metrics(op, target_o)
+                        kelly_pct = calc_risk_adj_kelly(adj_ev, var, risk_scale, op)
+                        profit = (target_o - 1) * unit_stake
+
+                        # 3. 將數據加入表格
+                        d_ou.append({
+                            "盤口": pick_name, "賠率": target_o, 
+                            "修正 EV": f"{adj_ev:+.1f}%", "預計獲利": f"${profit:.1f}",
+                            "夏普值": f"{sharpe:.2f}", "建議注碼%": f"{kelly_pct:.1f}%"
                         })
+                        
+                        # 4. 觸發推薦 (門檻維持 2%)
+                        if adj_ev > 2: 
+                            candidates.append({
+                                "type":"OU", "pick":pick_name, "ev":adj_ev, "raw_ev":raw_ev,
+                                "odds":target_o, "prob":op, "sens":"Medium",
+                                "sharpe": sharpe, "kelly": kelly_pct, "note": ""
+                            })
+                            
                 st.dataframe(pd.DataFrame(d_ou), use_container_width=True)
+            # ========================================
 
             st.subheader("📝 智能投資組合 (劇本加權)")
             if candidates:
@@ -494,7 +505,6 @@ if st.button("🚀 開始全方位分析", type="primary"):
             else:
                 st.info("無適合注單")
 
-        # --- Tab 2, 3, 4 維持不變 ---
         with res_tab2:
             st.subheader("🧠 模型裁決")
             total_xg = lh + la
@@ -505,13 +515,12 @@ if st.button("🚀 開始全方位分析", type="primary"):
             if candidates:
                 top = sorted(candidates, key=lambda x:x["ev"], reverse=True)[0]
                 
-                # V31.2: 統一使用去水機率做比較
                 market_imp = 0.0
                 if top['type'] == '1x2':
                     key_map = {"主勝":"home", "和局":"draw", "客勝":"away"}
                     market_imp = true_imp_probs.get(key_map.get(top['pick']), 0.0)
                 else:
-                    market_imp = 1.0/top['odds'] # AH/OU 暫時 fallback
+                    market_imp = 1.0/top['odds']
 
                 diff = top['prob'] - market_imp
                 col_c1, col_c2 = st.columns(2)
@@ -529,11 +538,9 @@ if st.button("🚀 開始全方位分析", type="primary"):
 
         with res_tab4:
             st.subheader("🎲 戰局模擬")
-            # V31.2: 使用 seed 參數
             sh, sa, sr = engine.run_monte_carlo(lh, la, sims=5000, seed=seed_val)
             
             sim_count = len(sr)
-            # V31.3: 補上這行 UI 佈局，防止 sc1 NameError
             sc1, sc2, sc3 = st.columns(3)
             
             sc1.metric("主勝率", f"{sr.count('home')/sim_count*100:.1f}%")
