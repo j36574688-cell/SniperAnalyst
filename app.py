@@ -20,29 +20,24 @@ def nb_pmf(k, mu, alpha):
     coeff = math.exp(math.lgamma(k + r) - math.lgamma(r) - math.lgamma(k + 1))
     return float(coeff * (p ** r) * ((1 - p) ** k))
 
-# 向量化加速矩陣建構
 @st.cache_data
 def get_matrix_cached(lh, la, max_g, nb_alpha, vol_adjust):
     G = max_g
     i = np.arange(G)
     j = np.arange(G)
     
-    # Poisson 外積
     p_i = np.array([poisson_pmf(k, lh) for k in i])
     p_j = np.array([poisson_pmf(k, la) for k in j])
     Mp = np.outer(p_i, p_j)
 
-    # NB 外積
     nb_i = np.array([nb_pmf(k, lh, nb_alpha) for k in i])
     nb_j = np.array([nb_pmf(k, la, nb_alpha) for k in j])
     Mn = np.outer(nb_i, nb_j)
 
     M = 0.6 * Mp + 0.4 * Mn
     
-    # 相關性修正
     rho = -0.18 if vol_adjust else -0.13
     
-    # 向量化修正 (只針對左上角 2x2 區域)
     if G > 1:
         M[0,0] *= (1 - lh*la*rho)
         M[1,0] *= (1 + la*rho)
@@ -160,7 +155,6 @@ class SniperAnalystLogic:
         if self.h["context_modifiers"]["missing_key_defender"]: h_def *= 1.20
         if self.a["context_modifiers"]["missing_key_defender"]: a_def *= 1.15
         
-        # 安全讀取主場優勢
         h_adv = self.h["general_strength"].get("home_advantage_weight", 1.15)
         
         lh = (h_att * a_def / league_base) * h_adv
@@ -180,7 +174,6 @@ class SniperAnalystLogic:
         return bonus
 
     def build_ensemble_matrix(self, lh, la):
-        # 安全讀取 volatility
         vol_str = self.h.get("style_of_play", {}).get("volatility", "normal")
         vol_adjust = (vol_str == "high")
         return get_matrix_cached(lh, la, self.max_g, self.nb_alpha, vol_adjust)
@@ -241,8 +234,8 @@ class SniperAnalystLogic:
 # =========================
 st.set_page_config(page_title="狙擊手分析 V31.3 Fix", page_icon="⚽", layout="wide")
 
-st.title("⚽ 狙擊手 V31.3 (雙向大小球修復版)")
-st.markdown("### 專業足球數據分析：向量化加速 x 隨機性控制 x 數據一致性")
+st.title("⚽ 狙擊手 V31.3 (流暢效能版)")
+st.markdown("### 專業足球數據分析：向量化加速 x 隨機性控制 x 去樣式優化")
 
 # --- 側邊欄 ---
 with st.sidebar:
@@ -305,7 +298,6 @@ if st.button("🚀 開始全方位分析", type="primary"):
     if not input_data:
         st.error("請先輸入有效的比賽數據！")
     else:
-        # 防呆：確保欄位存在
         if "recent_form_trend" not in input_data["home"]["context_modifiers"]:
             input_data["home"]["context_modifiers"]["recent_form_trend"] = [0,0,0]
         if "recent_form_trend" not in input_data["away"]["context_modifiers"]:
@@ -406,7 +398,6 @@ if st.button("🚀 開始全方位分析", type="primary"):
             with c_ah:
                 st.subheader("🛡️ 亞盤")
                 d_ah = []
-                # 安全讀取 target_odds
                 target_o = engine.market.get("target_odds", 1.90)
                 
                 for hcap in engine.market["handicaps"]:
@@ -431,24 +422,19 @@ if st.button("🚀 開始全方位分析", type="primary"):
                         })
                 st.dataframe(pd.DataFrame(d_ah), use_container_width=True)
             
-            # ===== 修正點：大小球雙向推薦邏輯 =====
             with c_ou:
                 st.subheader("📐 大小球 (雙向)")
                 d_ou = []
                 
-                # 優化：矩陣索引只算一次
                 G = engine.max_g
                 idx_sum = np.add.outer(np.arange(G), np.arange(G))
                 target_o = engine.market.get("target_odds", 1.90)
 
                 for line in engine.market["goal_lines"]:
-                    # 1. 分別計算 [大] 與 [小] 的機率
                     prob_over = float(M[idx_sum > line].sum())
                     prob_under = float(M[idx_sum < line].sum())
                     
-                    # 2. 雙向迴圈：同時評估 [大] 與 [小]
                     for side_label, op, pick_name in [("大", prob_over, f"大 {line}"), ("小", prob_under, f"小 {line}")]:
-                        
                         raw_ev = (op * target_o - 1) * 100
                         adj_ev = raw_ev * model_conf_score * memory_penalty
                         
@@ -456,14 +442,12 @@ if st.button("🚀 開始全方位分析", type="primary"):
                         kelly_pct = calc_risk_adj_kelly(adj_ev, var, risk_scale, op)
                         profit = (target_o - 1) * unit_stake
 
-                        # 3. 將數據加入表格
                         d_ou.append({
                             "盤口": pick_name, "賠率": target_o, 
                             "修正 EV": f"{adj_ev:+.1f}%", "預計獲利": f"${profit:.1f}",
                             "夏普值": f"{sharpe:.2f}", "建議注碼%": f"{kelly_pct:.1f}%"
                         })
                         
-                        # 4. 觸發推薦 (門檻維持 2%)
                         if adj_ev > 2: 
                             candidates.append({
                                 "type":"OU", "pick":pick_name, "ev":adj_ev, "raw_ev":raw_ev,
@@ -472,7 +456,6 @@ if st.button("🚀 開始全方位分析", type="primary"):
                             })
                             
                 st.dataframe(pd.DataFrame(d_ou), use_container_width=True)
-            # ========================================
 
             st.subheader("📝 智能投資組合 (劇本加權)")
             if candidates:
@@ -531,10 +514,11 @@ if st.button("🚀 開始全方位分析", type="primary"):
                 else: st.success("🟢 真實價值：顯著機率偏差")
 
         with res_tab3:
-            st.subheader("🎯 波膽分佈")
+            st.subheader("🎯 波膽分佈 (效能優化)")
             disp_g = min(6, engine.max_g)
             df_cs = pd.DataFrame(M[:disp_g,:disp_g], columns=[f"客{j}" for j in range(disp_g)], index=[f"主{i}" for i in range(disp_g)])
-            st.dataframe(df_cs.style.format("{:.1%}", subset=None).background_gradient(cmap="Blues", axis=None))
+            # V31.3 Fix: 移除背景漸層，保留百分比格式，解決滑動卡頓
+            st.dataframe(df_cs.style.format("{:.1%}", subset=None))
 
         with res_tab4:
             st.subheader("🎲 戰局模擬")
