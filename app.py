@@ -210,7 +210,7 @@ class SniperAnalystLogic:
 
     def ah_ev(self, M: np.ndarray, hcap: float, odds: float) -> float:
         G = self.max_g
-        # 使用廣播運算計算分差
+        # 向量化計算分差與派彩
         idx_diff = np.subtract.outer(np.arange(G), np.arange(G)) 
         r_matrix = idx_diff + hcap
         
@@ -225,18 +225,21 @@ class SniperAnalystLogic:
 
     def run_monte_carlo(self, lh: float, la: float, sims: int = 10000, seed: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray, List[str]]:
         """
-        優化版蒙地卡羅模擬：使用 Numpy 向量化操作提升效能
-        預設模擬次數已提升至 10,000 次
+        [V31.5 升級] 向量化蒙地卡羅模擬
+        - 預設次數提升至 10,000 次
+        - 使用 Numpy 向量運算取代 Python 迴圈，速度大幅提升
         """
         rng = np.random.default_rng(seed)
+        
+        # 1. 批量生成數據 (Vectorized generation)
         home_goals = rng.poisson(lh, sims)
         away_goals = rng.poisson(la, sims)
         
-        # 使用向量運算判斷勝負，不再使用 Python 迴圈
+        # 2. 向量化判斷勝負 (Vectorized comparison)
         diff = home_goals - away_goals
-        results = np.full(sims, "draw", dtype=object)
-        results[diff > 0] = "home"
-        results[diff < 0] = "away"
+        results = np.full(sims, "draw", dtype=object) # 預設全為和局
+        results[diff > 0] = "home" # 主勝
+        results[diff < 0] = "away" # 客勝
         
         return home_goals, away_goals, results.tolist()
 
@@ -277,10 +280,10 @@ class SniperAnalystLogic:
 # =========================
 st.set_page_config(page_title="狙擊手分析 V31.5 MC10K", page_icon="⚽", layout="wide")
 
-st.title("⚽ 狙擊手 V31.5 (架構優化 + 10K模擬版)")
-st.markdown("### 專業足球數據分析：向量化加速 x 狀態管理 x 10,000次精準模擬")
+st.title("⚽ 狙擊手 V31.5 (10,000次極速模擬版)")
+st.markdown("### 專業足球數據分析：向量化加速 x 狀態管理 x 大數據模擬")
 
-# --- 初始化 Session State (優化：防止切換 Tab 時數據消失) ---
+# --- 初始化 Session State (狀態管理：防止切換 Tab 時數據消失) ---
 if "analysis_results" not in st.session_state:
     st.session_state.analysis_results = None
 
@@ -375,7 +378,7 @@ if st.button("🚀 開始全方位分析", type="primary"):
         sens_level, sens_drop = engine.check_sensitivity(lh, la)
         model_conf_score, conf_reasons = engine.calc_model_confidence(lh, la, diff_h, sens_drop)
         
-        # 將計算結果存入 Session State
+        # 將計算結果存入 Session State (關鍵優化：鎖定結果)
         st.session_state.analysis_results = {
             "engine": engine,
             "M": M,
@@ -461,7 +464,7 @@ if st.session_state.analysis_results:
             if adj_ev > 1.5:
                 candidates.append({
                     "type":"1x2", "pick":tag, "ev":adj_ev, "raw_ev":raw_ev,
-                    "odds":odd, "prob":prob, "sens": "Low", # 簡化
+                    "odds":odd, "prob":prob, "sens": "Low",
                     "sharpe": sharpe, "kelly": kelly_pct, "note": note
                 })
         st.dataframe(pd.DataFrame(rows_1x2), use_container_width=True)
@@ -506,6 +509,7 @@ if st.session_state.analysis_results:
                 prob_over = float(M[idx_sum > line].sum())
                 prob_under = float(M[idx_sum < line].sum())
                 
+                # 雙向檢查
                 for side_label, op, pick_name in [("大", prob_over, f"大 {line}"), ("小", prob_under, f"小 {line}")]:
                     raw_ev = (op * target_o - 1) * 100
                     adj_ev = raw_ev * res["model_conf_score"] * res["memory_penalty"]
@@ -586,14 +590,16 @@ if st.session_state.analysis_results:
             else: st.success("🟢 真實價值：顯著機率偏差")
 
     with res_tab3:
-        st.subheader("🎯 波膽分佈 (效能優化)")
+        st.subheader("🎯 波膽分佈 (流暢優化版)")
         disp_g = min(6, engine.max_g)
         df_cs = pd.DataFrame(M[:disp_g,:disp_g], columns=[f"客{j}" for j in range(disp_g)], index=[f"主{i}" for i in range(disp_g)])
         st.dataframe(df_cs.style.format("{:.1%}", subset=None))
 
     with res_tab4:
-        st.subheader("🎲 戰局模擬 (10,000次)")
-        # 這裡會跑 10000 次模擬
+        st.subheader("🎲 戰局模擬 (10,000次極速版)")
+        
+        # 
+        
         sh, sa, sr = engine.run_monte_carlo(res["lh"], res["la"], sims=10000, seed=seed_val)
         
         sim_count = len(sr)
@@ -616,7 +622,6 @@ if st.session_state.analysis_results:
         def get_s(stats):
             form_val = sum(stats.get("context_modifiers", {}).get("recent_form_trend", [0,0,0]))
             form_score = (form_val + 3) * 1.5 
-            # 修正 xg 讀取邏輯
             xg = stats["offensive_stats"].get("xg_avg", stats["offensive_stats"]["goals_scored_avg"])
             xga = stats["defensive_stats"].get("xga_avg", stats["defensive_stats"]["goals_conceded_avg"])
             h_adv = stats["general_strength"].get("home_advantage_weight", 1.0)
