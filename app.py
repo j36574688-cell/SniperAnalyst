@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 from typing import Dict, List, Tuple, Any, Optional
 
 # =========================
-# 1. 核心數學工具 (Math Utils - V33.0 穩定混合版)
+# 1. 核心數學工具 (Math Utils)
 # =========================
 
 def poisson_pmf(k: int, lam: float) -> float:
@@ -15,8 +15,7 @@ def poisson_pmf(k: int, lam: float) -> float:
     return math.exp(-lam + k * math.log(lam) - math.lgamma(k + 1))
 
 def nb_pmf(k: int, mu: float, alpha: float) -> float:
-    if alpha <= 0:
-        return poisson_pmf(k, mu)
+    if alpha <= 0: return poisson_pmf(k, mu)
     r = 1.0 / alpha
     p = r / (r + mu)
     coeff = math.exp(math.lgamma(k + r) - math.lgamma(r) - math.lgamma(k + 1))
@@ -80,20 +79,14 @@ class RegimeMemory:
         h, a = engine.h, engine.a
         odds = engine.market["1x2_odds"]
         prob_h = 1.0 / odds["home"]
-        h_odds = odds["home"]
         form_h_score = sum(h["context_modifiers"].get("recent_form_trend", [0]))
-        form_a_score = sum(a["context_modifiers"].get("recent_form_trend", [0]))
-        motiv_h, motiv_a = h["context_modifiers"]["motivation"], a["context_modifiers"]["motivation"]
+        motiv_h = h["context_modifiers"]["motivation"]
         
-        if h_odds < 2.10 and form_h_score < -1: return "Fallen_Giant"
+        if odds["home"] < 2.10 and form_h_score < -1: return "Fallen_Giant"
         if prob_h > 0.65 and form_h_score < 0: return "Injury_Crisis_Fav"
         if motiv_h == "title_race" and prob_h > 0.65: return "Title_MustWin_Home"
-        if (motiv_h == "survival" or motiv_a == "survival") and prob_h < 0.35: return "Relegation_Dog"
-        
-        h_adv = h["general_strength"].get("home_advantage_weight", 1.15)
-        if h_adv > 1.15 and h_odds < 2.0 and form_h_score >= 1: return "Fortress_Home"
-        if h_odds < 1.30: return "MarketHype_Fav"
-        if (lh + la) < 2.2 and abs(form_h_score) < 2 and abs(form_a_score) < 2: return "Bore_Draw_Stalemate"
+        if odds["home"] < 1.30: return "MarketHype_Fav"
+        if (lh + la) < 2.2: return "Bore_Draw_Stalemate"
         return "MidTable_Standard"
 
     def recall_experience(self, regime_id: str) -> Dict:
@@ -102,12 +95,11 @@ class RegimeMemory:
     def calc_memory_penalty(self, historical_roi: float) -> float:
         if historical_roi < -0.10: return 0.5
         if historical_roi < -0.05: return 0.7
-        if historical_roi > 0.15: return 1.2
         if historical_roi > 0.05: return 1.1
         return 1.0
 
 # =========================
-# 3. 分析引擎邏輯 (V33.0 混合矩陣引擎)
+# 3. 分析引擎邏輯 (V33.0 修正邏輯)
 # =========================
 class SniperAnalystLogic:
     def __init__(self, json_data: Any, max_g: int = 9, nb_alpha: float = 0.12):
@@ -118,95 +110,80 @@ class SniperAnalystLogic:
         self.memory = RegimeMemory()
 
     def calc_lambda(self) -> Tuple[float, float]:
-        """[V33.0 升級] 加入時間衰減近況加權邏輯"""
         league_base = 1.35
-        def att_def_weighted(team):
+        def att_def_w(team):
             xg, xga = team["offensive_stats"].get("xg_avg", team["offensive_stats"]["goals_scored_avg"]), team["defensive_stats"].get("xga_avg", team["defensive_stats"]["goals_conceded_avg"])
             trend = team["context_modifiers"].get("recent_form_trend", [0, 0, 0])
-            # 近況加權：最近一場權重 0.6，其次 0.3，最遠 0.1
-            w = np.array([0.1, 0.3, 0.6])
+            w = np.array([0.1, 0.3, 0.6]) # 近況加權
             form_factor = 1.0 + (np.dot(trend[-len(w):], w[-len(trend):]) * 0.1)
             return (0.3 * team["offensive_stats"]["goals_scored_avg"] + 0.7 * xg) * form_factor, (0.3 * team["defensive_stats"]["goals_conceded_avg"] + 0.7 * xga)
 
-        lh_att, lh_def = att_def_weighted(self.h)
-        la_att, la_def = att_def_weighted(self.a)
-        
+        lh_att, lh_def = att_def_w(self.h)
+        la_att, la_def = att_def_w(self.a)
         if self.h["context_modifiers"].get("missing_key_defender"): lh_def *= 1.25
         if self.a["context_modifiers"].get("missing_key_defender"): la_def *= 1.20
         h_adv = self.h["general_strength"].get("home_advantage_weight", 1.15)
-        
-        lh = (lh_att * la_def / league_base) * h_adv
-        la = (la_att * lh_def / league_base)
-        if self.h["context_modifiers"]["motivation"] == "survival": lh *= 1.05
-        if self.a["context_modifiers"]["motivation"] == "title_race": la *= 1.05
-        return lh, la
+        return (lh_att * la_def / league_base) * h_adv, (la_att * lh_def / league_base)
 
     def build_ensemble_matrix(self, lh: float, la: float) -> np.ndarray:
-        """[V33.0 升級] 混合矩陣：將物理模型與市場共識以 7:3 混合再平衡"""
         vol_adjust = (self.h.get("style_of_play", {}).get("volatility") == "high")
         M_model = get_matrix_cached(lh, la, self.max_g, self.nb_alpha, vol_adjust)
-        
-        # 獲取市場隱含機率
         true_imp = get_true_implied_prob(self.market["1x2_odds"])
-        m_h, m_d, m_a = true_imp["home"], true_imp["draw"], true_imp["away"]
-        
-        # 模型原始機率
         p_h, p_d, p_a = float(np.sum(np.tril(M_model, -1))), float(np.sum(np.diag(M_model))), float(np.sum(np.triu(M_model, 1)))
         
-        # 混合疊加權重: Model 70%, Market 30%
+        # V33 混合權重 7:3
         w = 0.7
-        t_h, t_d, t_a = w*p_h + (1-w)*m_h, w*p_d + (1-w)*m_d, w*p_a + (1-w)*m_a
+        t_h, t_d, t_a = w*p_h + (1-w)*true_imp["home"], w*p_d + (1-w)*true_imp["draw"], w*p_a + (1-w)*true_imp["away"]
         
-        # 矩陣分區重標定 (Re-balancing)
         M_hybrid = M_model.copy()
         M_hybrid[np.tril_indices(self.max_g, -1)] *= (t_h / p_h if p_h > 0 else 1)
         M_hybrid[np.diag_indices(self.max_g)] *= (t_d / p_d if p_d > 0 else 1)
         M_hybrid[np.triu_indices(self.max_g, 1)] *= (t_a / p_a if p_a > 0 else 1)
-        
         return M_hybrid / M_hybrid.sum()
+
+    def get_market_trend_bonus(self) -> Dict[str, float]:
+        bonus = {"home":0.0, "draw":0.0, "away":0.0}
+        op, cu = self.market.get("opening_odds"), self.market.get("1x2_odds")
+        if not op or not cu: return bonus
+        for k in bonus:
+            drop = max(0.0, (op[k] - cu[k]) / op[k])
+            bonus[k] = min(3.0, drop * 30.0)
+        return bonus
 
     def ah_ev(self, M: np.ndarray, hcap: float, odds: float) -> float:
         q = int(round(hcap * 4))
         if q % 2 != 0:
-            h1, h2 = (q + 1) / 4.0, (q - 1) / 4.0
-            return 0.5 * self.ah_ev(M, h1, odds) + 0.5 * self.ah_ev(M, h2, odds)
+            return 0.5 * self.ah_ev(M, (q+1)/4.0, odds) + 0.5 * self.ah_ev(M, (q-1)/4.0, odds)
         idx_diff = np.subtract.outer(np.arange(self.max_g), np.arange(self.max_g)) 
         r_matrix = idx_diff + hcap
         payoff = np.select([r_matrix > 0.001, np.abs(r_matrix) <= 0.001, r_matrix < -0.001], [odds - 1, 0, -1], default=-1)
         return np.sum(M * payoff) * 100
 
     def run_monte_carlo(self, M: np.ndarray, sims: int = 10000, seed: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray, List[str]]:
-        rng = np.random.default_rng(seed); G = M.shape[0]
-        flat_M = M.flatten(); flat_M /= flat_M.sum()
-        indices = rng.choice(G * G, size=sims, p=flat_M)
+        rng = np.random.default_rng(seed); G = M.shape[0]; flat_M = M.flatten()
+        indices = rng.choice(G * G, size=sims, p=flat_M/flat_M.sum())
         sh, sa = indices // G, indices % G
-        diff = sh - sa
-        res = np.full(sims, "draw", dtype=object); res[diff > 0] = "home"; res[diff < 0] = "away"
+        res = np.full(sims, "draw", dtype=object); res[sh > sa] = "home"; res[sh < sa] = "away"
         return sh, sa, res.tolist()
 
     def check_sensitivity(self, lh: float, la: float) -> Tuple[str, float]:
         M_stress = get_matrix_cached(lh, la + 0.3, self.max_g, self.nb_alpha, False)
         M_orig = self.build_ensemble_matrix(lh, la)
-        p_h_orig = float(np.sum(np.tril(M_orig, -1)))
-        p_h_new = float(np.sum(np.tril(M_stress, -1)))
+        p_h_orig, p_h_new = float(np.sum(np.tril(M_orig, -1))), float(np.sum(np.tril(M_stress, -1)))
         drop = (p_h_orig - p_h_new) / p_h_orig if p_h_orig > 0 else 0
-        level = "High" if drop > 0.15 else ("Medium" if drop > 0.08 else "Low")
-        return level, drop
+        return ("High" if drop > 0.15 else "Medium" if drop > 0.08 else "Low"), drop
 
-    def calc_model_confidence(self, lh: float, la: float, market_diff_percent: float, sens_drop_rate: float) -> Tuple[float, List[str]]:
+    def calc_model_confidence(self, lh: float, la: float, market_diff: float, sens_drop: float) -> Tuple[float, List[str]]:
         score, reasons = 1.0, []
-        if market_diff_percent > 0.25: score *= 0.7; reasons.append(f"與市場差異過大 ({market_diff_percent:.1%})")
-        elif market_diff_percent > 0.15: score *= 0.85; reasons.append(f"與市場顯著分歧 ({market_diff_percent:.1%})")
-        if sens_drop_rate > 0.15: score *= 0.8; reasons.append("模型對運氣球極度敏感")
-        if (lh + la) > 3.5: score *= 0.9; reasons.append("高入球預期 (亂戰風險)")
+        if market_diff > 0.25: score *= 0.7; reasons.append(f"與市場差異過大 ({market_diff:.1%})")
+        if sens_drop > 0.15: score *= 0.8; reasons.append("模型對運氣球極度敏感")
         return score, reasons
 
 # =========================
-# 4. Streamlit UI 介面 (完全保留 V32.0 配置)
+# 4. Streamlit UI (V32 樣式完全保留)
 # =========================
-st.set_page_config(page_title="狙擊手 V33.0 Lite (核心混合版)", page_icon="⚽", layout="wide")
+st.set_page_config(page_title="Sniper V33.0 Lite", page_icon="⚽", layout="wide")
 st.title("⚽ 狙擊手 V33.0 Lite (核心混合版)")
-st.markdown("### 修正重點：V33 近況權重加權 / Hybrid Matrix 市場混合 / V32 介面完全兼容")
 
 if "analysis_results" not in st.session_state:
     st.session_state.analysis_results = None
@@ -214,11 +191,9 @@ if "analysis_results" not in st.session_state:
 with st.sidebar:
     st.header("⚙️ 參數設定")
     unit_stake = st.number_input("💰 設定單注本金 ($)", 10, 10000, 100)
-    st.divider()
     nb_alpha = st.slider("Alpha (變異數)", 0.05, 0.20, 0.12, 0.01)
     max_g = st.number_input("運算範圍 (max_g)", 5, 20, 9)
     risk_scale = st.slider("風險縮放係數", 0.1, 1.0, 0.3, 0.1)
-    st.divider()
     enable_fixed_seed = st.toggle("固定隨機數種子", value=True)
     seed_val = 42 if enable_fixed_seed else None
     use_mock_memory = st.checkbox("🧠 啟用歷史記憶", value=True)
@@ -272,7 +247,6 @@ if st.session_state.analysis_results:
             c_h1, c_h2 = st.columns(2)
             c_h1.metric("歷史樣本", f"{history_data['bets']}場")
             c_h2.metric("歷史 ROI", f"{history_data['roi']*100:.1f}%")
-            if res["memory_penalty"] < 1.0: st.error(f"⚠️ 歷史虧損懲罰: x {res['memory_penalty']}")
         st.divider(); st.subheader("🛡️ 模型信心")
         st.metric("Confidence", f"{res['model_conf_score']*100:.0f}/100")
 
@@ -292,7 +266,7 @@ if st.session_state.analysis_results:
             adj_ev = raw_ev * res["model_conf_score"] * res["memory_penalty"]
             var, sharpe = calc_risk_metrics(prob, odd)
             kelly = calc_risk_adj_kelly(adj_ev, var, risk_scale, prob)
-            rows_1x2.append({"選項": tag, "賠率": odd, "原始 EV": f"{raw_ev:+.1f}%", "修正 EV": f"{adj_ev:+.1f}%", "預計獲利": f"${(odd-1)*unit_stake:.1f}", "夏普值": f"{sharpe:.2f}", "建議注碼%": f"{kelly:.1f}%"})
+            rows_1x2.append({"選項": tag, "賠率": odd, "原始 EV": f"{raw_ev:+.1f}%", "修正 EV": f"{adj_ev:+.1f}%", "夏普值": f"{sharpe:.2f}", "建議注碼%": f"{kelly:.1f}%"})
             if adj_ev > 1.5: candidates.append({"type":"1x2", "pick":tag, "ev":adj_ev, "odds":odd, "prob":prob, "sharpe": sharpe, "kelly": kelly})
         st.dataframe(pd.DataFrame(rows_1x2), use_container_width=True)
 
@@ -321,15 +295,6 @@ if st.session_state.analysis_results:
                     d_ou.append({"盤口": p_n, "賠率": t_o, "修正 EV": f"{adj_ev:+.1f}%", "夏普值": f"{sharpe:.2f}", "建議注碼%": f"{calc_risk_adj_kelly(adj_ev, var, risk_scale, op):.1f}%"})
                     if adj_ev > 2: candidates.append({"type":"OU", "pick":p_n, "ev":adj_ev, "odds":t_o, "prob":op, "sharpe": sharpe, "kelly": calc_risk_adj_kelly(adj_ev, var, risk_scale, op)})
             st.dataframe(pd.DataFrame(d_ou), use_container_width=True)
-
-        st.subheader("📝 智能投資組合")
-        if candidates:
-            f_picks = sorted(candidates, key=lambda x:x["ev"], reverse=True)[:3]
-            reco = []
-            for p in f_picks:
-                icon = "🟢" if p['sharpe'] > 0.1 else ("🟡" if p['sharpe'] > 0.05 else "🔴")
-                reco.append([f"[{p['type']}] {p['pick']}", p['odds'], f"{p['ev']:+.1f}%", f"{icon} {p['sharpe']:.3f}", f"{p['kelly']:.1f}%", f"${unit_stake*p['kelly']/10.0:.1f}"])
-            st.dataframe(pd.DataFrame(reco, columns=["選項", "賠率", "修正EV", "夏普值", "注碼%", "金額"]), use_container_width=True)
 
     with t2:
         st.subheader("🧠 模型裁決")
