@@ -9,7 +9,7 @@ import os
 from typing import Dict, List, Tuple, Any, Optional
 
 # =========================
-# 1. 核心數學工具
+# 1. 核心數學工具 (V33 混合運算內核)
 # =========================
 
 def poisson_pmf(k: int, lam: float) -> float:
@@ -24,12 +24,14 @@ def nb_pmf(k: int, mu: float, alpha: float) -> float:
     return float(coeff * (p ** r) * ((1 - p) ** k))
 
 def get_true_implied_prob(odds_dict: Dict[str, float]) -> Dict[str, float]:
+    """計算去水後的市場真實機率"""
     inv = {k: 1.0 / float(v) if v > 0 else 0.0 for k, v in odds_dict.items()}
     margin = sum(inv.values())
     return {k: inv[k] / margin if margin > 0 else 0.0 for k in odds_dict}
 
 @st.cache_data
 def get_matrix_cached(lh: float, la: float, max_g: int, nb_alpha: float, vol_adjust: bool) -> np.ndarray:
+    """基礎物理模型矩陣"""
     G = max_g
     i, j = np.arange(G), np.arange(G)
     p_i = np.array([poisson_pmf(k, lh) for k in i]); p_j = np.array([poisson_pmf(k, la) for k in j])
@@ -59,7 +61,7 @@ def calc_risk_metrics(prob: float, odds: float) -> Tuple[float, float]:
     return var, sharpe
 
 # =========================
-# 2. 全景記憶體系
+# 2. 全景記憶體系 (V32 保留)
 # =========================
 class RegimeMemory:
     def __init__(self):
@@ -81,7 +83,6 @@ class RegimeMemory:
         h, a = engine.h, engine.a
         odds = engine.market["1x2_odds"]
         prob_h = 1.0 / odds["home"]
-        h_odds = odds["home"]
         form_h_score = sum(h["context_modifiers"].get("recent_form_trend", [0]))
         motiv_h = h["context_modifiers"]["motivation"]
         
@@ -102,7 +103,7 @@ class RegimeMemory:
         return 1.0
 
 # =========================
-# 3. 分析引擎邏輯
+# 3. 分析引擎邏輯 (V33 混合矩陣 + 修復版)
 # =========================
 class SniperAnalystLogic:
     def __init__(self, json_data: Any, max_g: int = 9, nb_alpha: float = 0.12):
@@ -115,15 +116,18 @@ class SniperAnalystLogic:
         self.memory = RegimeMemory()
 
     def calc_lambda(self) -> Tuple[float, float, bool]:
-        """[V33] 加入 Time-Decay 近況加權"""
+        """[V33] 加入 Time-Decay 近況加權，並回傳是否加權旗標"""
         league_base = 1.35
         is_weighted = False
         def att_def_w(team):
             nonlocal is_weighted
             xg, xga = team["offensive_stats"].get("xg_avg", team["offensive_stats"]["goals_scored_avg"]), team["defensive_stats"].get("xga_avg", team["defensive_stats"]["goals_conceded_avg"])
             trend = team["context_modifiers"].get("recent_form_trend", [0, 0, 0])
-            if any(trend): is_weighted = True
-            w = np.array([0.1, 0.3, 0.6])
+            
+            # 判斷是否啟動加權
+            if any(t != 0 for t in trend): is_weighted = True
+            
+            w = np.array([0.1, 0.3, 0.6]) # 加權核心: 近期權重重
             form_factor = 1.0 + (np.dot(trend[-len(w):], w[-len(trend):]) * 0.1)
             return (0.3 * team["offensive_stats"]["goals_scored_avg"] + 0.7 * xg) * form_factor, (0.3 * team["defensive_stats"]["goals_conceded_avg"] + 0.7 * xga)
 
@@ -132,10 +136,11 @@ class SniperAnalystLogic:
         if self.h["context_modifiers"].get("missing_key_defender"): lh_def *= 1.25
         if self.a["context_modifiers"].get("missing_key_defender"): la_def *= 1.20
         h_adv = self.h["general_strength"].get("home_advantage_weight", 1.15)
+        
         return (lh_att * la_def / league_base) * h_adv, (la_att * lh_def / league_base), is_weighted
 
     def build_ensemble_matrix(self, lh: float, la: float) -> Tuple[np.ndarray, Dict]:
-        """[V33] 混合矩陣 (回傳矩陣與機率細節)"""
+        """[V33] 混合矩陣 (Model 70% + Market 30%)"""
         vol_adjust = (self.h.get("style_of_play", {}).get("volatility") == "high")
         M_model = get_matrix_cached(lh, la, self.max_g, self.nb_alpha, vol_adjust)
         true_imp = get_true_implied_prob(self.market["1x2_odds"])
@@ -161,6 +166,7 @@ class SniperAnalystLogic:
         }
         return M_hybrid, probs_detail
 
+    # --- 修復點：補回被遺漏的 market_bonus 方法 ---
     def get_market_trend_bonus(self) -> Dict[str, float]:
         bonus = {"home":0.0, "draw":0.0, "away":0.0}
         op, cu = self.market.get("opening_odds"), self.market.get("1x2_odds")
@@ -200,19 +206,19 @@ class SniperAnalystLogic:
         score, reasons = 1.0, []
         if market_diff > 0.25: score *= 0.7; reasons.append(f"與市場差異過大 ({market_diff:.1%})")
         if sens_drop > 0.15: score *= 0.8; reasons.append("模型對運氣球極度敏感")
+        if (lh + la) > 3.5: score *= 0.9; reasons.append("高變異風險 (xG > 3.5)")
         return score, reasons
 
 # =========================
-# 4. Streamlit UI
+# 4. Streamlit UI (V33 Ultimate)
 # =========================
 st.set_page_config(page_title="Sniper V33.0 Ultimate", page_icon="🎯", layout="wide")
 
-# CSS 優化：讓儀表板更好看
+# CSS 優化
 st.markdown("""
 <style>
     .metric-box { background-color: #f0f2f6; padding: 10px; border-radius: 8px; text-align: center; }
     .highlight { color: #ff4b4b; font-weight: bold; }
-    .reco-card { border-left: 5px solid #28a745; background-color: #e6ffed; padding: 10px; margin-bottom: 5px; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -220,7 +226,7 @@ st.markdown("""
 with st.sidebar:
     st.title("🎯 Sniper V33.0")
     st.markdown("---")
-    app_mode = st.radio("功能模式：", ["🎯 單場深度預測 (V32介面)", "📈 聯賽歷史回測", "📚 劇本與 ROI 查詢"])
+    app_mode = st.radio("功能模式：", ["🎯 單場深度預測", "📈 聯賽歷史回測", "📚 劇本與 ROI 查詢"])
     st.divider()
     with st.expander("🛠️ 進階參數 (V33核心)", expanded=False):
         unit_stake = st.number_input("單注本金 ($)", 10, 10000, 100)
@@ -231,7 +237,7 @@ with st.sidebar:
 # =========================
 # 模式 1: 單場深度預測
 # =========================
-if app_mode == "🎯 單場深度預測 (V32介面)":
+if app_mode == "🎯 單場深度預測":
     st.header("🎯 單場深度預測 (V33 Hybrid Core)")
     
     if "analysis_results" not in st.session_state:
@@ -272,7 +278,7 @@ if app_mode == "🎯 單場深度預測 (V32介面)":
                 "engine": engine, "M": M, "lh": lh, "la": la, "is_weighted": is_weighted,
                 "probs_detail": probs_detail, "market_bonus": market_bonus,
                 "history_data": history_data, "penalty": penalty,
-                "conf_score": conf_score, "prob_h": p_h
+                "conf_score": conf_score, "conf_reasons": conf_reasons
             }
         else:
             st.error("請輸入數據")
@@ -282,29 +288,38 @@ if app_mode == "🎯 單場深度預測 (V32介面)":
         engine, M = res["engine"], res["M"]
         probs = res["probs_detail"]
 
-        # --- [V33 視覺增強] 差異儀表板 ---
-        st.markdown("### 🔍 V33 差異監測器 (Diff Monitor)")
+        # --- V33 差異監測器 ---
+        st.markdown("### 🔍 V33 戰術電腦監測 (Tactical Monitor)")
         d1, d2, d3, d4 = st.columns(4)
         d1.metric("主隊進球預期", f"{res['lh']:.2f}", delta="近況加權" if res["is_weighted"] else None)
         d2.metric("客隊進球預期", f"{res['la']:.2f}")
         
-        # 顯示 V32 (純模型) vs V33 (混合) 的機率差異
-        model_p = probs["model"]["home"]
+        # V33 視覺核心：混合差異
         hybrid_p = probs["hybrid"]["home"]
+        model_p = probs["model"]["home"]
         delta_p = (hybrid_p - model_p) * 100
-        d3.metric("主勝機率 (V33)", f"{hybrid_p:.1%}", delta=f"{delta_p:+.1f}% (修正)", delta_color="inverse")
-        d4.metric("市場隱含機率", f"{probs['market']['home']:.1%}")
+        d3.metric("V33 混合主勝", f"{hybrid_p:.1%}", delta=f"{delta_p:+.1f}% (修正)", delta_color="inverse")
         
-        # --- 原始 V32 側邊欄 ---
+        # 信心指數回歸
+        conf_score = res["conf_score"]
+        d4.metric("🛡️ 模型信心", f"{conf_score:.0%}", delta="風險過高" if conf_score < 0.7 else "信心充足")
+
+        # 信心扣分詳情 (Expander)
+        if conf_score < 1.0:
+            with st.expander(f"⚠️ 信心扣分診斷 (目前: {conf_score:.0%})", expanded=True):
+                for r in res["conf_reasons"]:
+                    st.warning(f"🔻 {r}")
+
+        # --- 側邊欄狀態 ---
         with st.sidebar:
             st.divider(); st.subheader("盤口劇本"); st.info(res['history_data']['name'])
             if use_mock_memory: st.metric("歷史 ROI", f"{res['history_data']['roi']:.1%}")
-            st.metric("模型信心", f"{res['conf_score']:.0%}")
+            st.metric("模型信心", f"{conf_score:.0%}")
 
         # --- 內容 Tabs ---
         t_val, t_ai, t_score, t_sim = st.tabs(["💰 價值投資建議", "🧠 智能裁決", "🎯 波膽分佈", "🎲 模擬"])
         
-        candidates = [] # 收集所有注單
+        candidates = [] 
         
         with t_val:
             # 1. 1x2 獨贏
@@ -314,22 +329,21 @@ if app_mode == "🎯 單場深度預測 (V32介面)":
                 prob = probs["hybrid"][key]
                 odd = engine.market["1x2_odds"][key]
                 raw_ev = (prob * odd - 1) * 100 + res["market_bonus"][key]
-                adj_ev = raw_ev * res["conf_score"] * res["penalty"]
+                adj_ev = raw_ev * conf_score * res["penalty"]
                 var, sharpe = calc_risk_metrics(prob, odd)
                 kelly = calc_risk_adj_kelly(adj_ev, var, risk_scale, prob)
                 r_1x2.append({"選項": tag, "賠率": odd, "修正EV": f"{adj_ev:+.1f}%", "注碼%": f"{kelly:.1f}%"})
                 if adj_ev > 1.0: candidates.append({"pick": tag, "odds": odd, "ev": adj_ev, "kelly": kelly, "type": "1x2", "sharpe": sharpe})
             st.dataframe(pd.DataFrame(r_1x2), use_container_width=True)
             
-            # 2. 亞盤 AH
+            # 2. 亞盤 AH & 大小 OU
             c_ah, c_ou = st.columns(2)
             with c_ah:
                 st.subheader("亞盤 (AH)")
                 target_o = engine.market.get("target_odds", 1.90)
                 for hcap in engine.market["handicaps"]:
                     raw_ev = engine.ah_ev(M, hcap, target_o) + res["market_bonus"]["home"]
-                    adj_ev = raw_ev * res["conf_score"] * res["penalty"]
-                    # 反推隱含機率
+                    adj_ev = raw_ev * conf_score * res["penalty"]
                     prob_apx = (raw_ev/100.0 + 1) / target_o
                     var, sharpe = calc_risk_metrics(prob_apx, target_o)
                     kelly = calc_risk_adj_kelly(adj_ev, var, risk_scale, prob_apx)
@@ -342,19 +356,17 @@ if app_mode == "🎯 單場深度預測 (V32介面)":
                 for line in engine.market["goal_lines"]:
                     p_over = float(M[idx_sum > line].sum())
                     raw_ev = (p_over * target_o - 1) * 100
-                    adj_ev = raw_ev * res["conf_score"] * res["penalty"]
+                    adj_ev = raw_ev * conf_score * res["penalty"]
                     var, sharpe = calc_risk_metrics(p_over, target_o)
                     kelly = calc_risk_adj_kelly(adj_ev, var, risk_scale, p_over)
                     if adj_ev > 1.5: candidates.append({"pick": f"大 {line}", "odds": target_o, "ev": adj_ev, "kelly": kelly, "type": "OU", "sharpe": sharpe})
                     st.write(f"大 {line}: **{adj_ev:+.1f}%** EV")
 
-            # --- 🔥 智能排行榜回歸 ---
+            # --- 🏆 智能投資組合排行榜 (回歸!) ---
             st.divider()
             st.markdown("### 🏆 智能投資組合 (Smart Portfolio)")
             if candidates:
-                # 排序
                 best_picks = sorted(candidates, key=lambda x: x['ev'], reverse=True)[:3]
-                
                 reco_data = []
                 for p in best_picks:
                     amt = unit_stake * (p['kelly'] / 100.0)
@@ -370,8 +382,6 @@ if app_mode == "🎯 單場深度預測 (V32介面)":
                 
                 df_reco = pd.DataFrame(reco_data, columns=["選項", "賠率", "修正EV", "夏普值", "注碼%", "建議金額"])
                 st.dataframe(df_reco, use_container_width=True)
-                
-                # 簡單文字總結
                 top = best_picks[0]
                 st.success(f"🔥 首選推薦：**{top['pick']}** (EV {top['ev']:.1f}%)，建議本金投入 {top['kelly']:.1f}%")
             else:
@@ -392,17 +402,32 @@ if app_mode == "🎯 單場深度預測 (V32介面)":
             fig, ax = plt.subplots(figsize=(6,3))
             ax.hist(sh, alpha=0.5, label="Home"); ax.hist(sa, alpha=0.5, label="Away"); ax.legend()
             st.pyplot(fig)
+            st.divider()
+            
+            # 雷達圖
+            st.subheader("⚔️ 戰力雷達")
+            cats = ['Attack', 'Defense', 'Form', 'Home/Away', 'Motivation']
+            def get_s(s):
+                f_s = (sum(s["context_modifiers"].get("recent_form_trend", [0])) + 3) * 1.5
+                xg = s["offensive_stats"].get("xg_avg", 1.0)
+                xga = s["defensive_stats"].get("xga_avg", 1.0)
+                return [min(10, xg*4), min(10, (3-xga)*3.5), f_s, s["general_strength"].get("home_advantage_weight", 1.0)*5, 8 if s["context_modifiers"]["motivation"]!="normal" else 5]
+            
+            hs, ans = get_s(engine.h), get_s(engine.a)
+            ang = [n/5*2*math.pi for n in range(5)]; ang+=ang[:1]; hs+=hs[:1]; ans+=ans[:1]
+            fr, ar = plt.subplots(figsize=(6,6), subplot_kw=dict(polar=True))
+            ar.plot(ang, hs, label='Home'); ar.fill(ang, hs, alpha=0.2); ar.plot(ang, ans, label='Away'); ar.fill(ang, ans, alpha=0.2); ar.set_xticks(ang[:-1]); ar.set_xticklabels(cats); ar.legend()
+            st.pyplot(fr)
 
 # =========================
-# 模式 2 & 3: 佔位符 (功能已預留)
+# 模式 2 & 3: 其他功能
 # =========================
 elif app_mode == "📈 聯賽歷史回測":
     st.title("📈 聯賽歷史回測")
-    st.info("請將 CSV 檔案放入資料夾後，使用 V33 回測引擎進行批量驗證。")
-    # (此處可放入之前的 Batch Backtest 邏輯)
+    st.info("功能建置中... 請使用 Batch Script 進行批量測試")
 
 elif app_mode == "📚 劇本與 ROI 查詢":
     st.title("📚 盤口劇本庫")
     mem = RegimeMemory()
-    data = [{"劇本": v["name"], "ROI": f"{v['roi']:.1%}"} for k, v in mem.history_db.items()]
-    st.dataframe(pd.DataFrame(data))
+    data = [{"劇本": v["name"], "ROI": f"{v['roi']:.1%}", "樣本": v["bets"]} for k, v in mem.history_db.items()]
+    st.dataframe(pd.DataFrame(data), use_container_width=True)
