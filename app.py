@@ -7,31 +7,34 @@ import matplotlib.pyplot as plt
 from typing import Dict, List, Tuple, Any, Optional
 
 # =========================
-# 1. 核心數學工具 (Math Utils - 數值穩定版)
+# 1. 核心數學工具 (Math Utils)
 # =========================
 
 def poisson_pmf(k: int, lam: float) -> float:
-    """[V32.0] 使用 lgamma 避免階乘溢位，提升大比分計算穩定性"""
+    """[V33.0] 基礎 Poisson 機率"""
     if lam <= 0: return 1.0 if k == 0 else 0.0
-    # exp(-lam + k*ln(lam) - ln(k!))
     return math.exp(-lam + k * math.log(lam) - math.lgamma(k + 1))
 
 def nb_pmf(k: int, mu: float, alpha: float) -> float:
-    """計算負二項分佈機率質量函數 (維持 lgamma)"""
-    if alpha <= 0:
-        return poisson_pmf(k, mu)
+    """[V33.0] 負二項分佈 (處理高變異比賽)"""
+    if alpha <= 0: return poisson_pmf(k, mu)
     r = 1.0 / alpha
     p = r / (r + mu)
     coeff = math.exp(math.lgamma(k + r) - math.lgamma(r) - math.lgamma(k + 1))
     return float(coeff * (p ** r) * ((1 - p) ** k))
 
+def implied_prob(odds: float) -> float:
+    """[V33.0] 計算隱含機率 (倒數)"""
+    return 1.0 / odds if odds > 1.0 else 0.0
+
 @st.cache_data
-def get_matrix_cached(lh: float, la: float, max_g: int, nb_alpha: float, vol_adjust: bool) -> np.ndarray:
-    """快取矩陣計算結果"""
+def get_base_matrix(lh: float, la: float, max_g: int, nb_alpha: float, vol_adjust: bool) -> np.ndarray:
+    """[V33.0] 生成基礎物理矩陣 (Model Matrix)"""
     G = max_g
     i = np.arange(G)
     j = np.arange(G)
     
+    # 混合 Poisson 與 Negative Binomial
     p_i = np.array([poisson_pmf(k, lh) for k in i])
     p_j = np.array([poisson_pmf(k, la) for k in j])
     Mp = np.outer(p_i, p_j)
@@ -40,10 +43,11 @@ def get_matrix_cached(lh: float, la: float, max_g: int, nb_alpha: float, vol_adj
     nb_j = np.array([nb_pmf(k, la, nb_alpha) for k in j])
     Mn = np.outer(nb_i, nb_j)
 
-    M = 0.6 * Mp + 0.4 * Mn
+    # V33 設定：模型權重 60% NB (抗波動), 40% Poisson
+    M = 0.4 * Mp + 0.6 * Mn
     
-    rho = -0.18 if vol_adjust else -0.13
-    
+    # 相關性修正 (Dependency Correction)
+    rho = -0.18 if vol_adjust else -0.12
     if G > 1:
         M[0,0] *= (1 - lh*la*rho)
         M[1,0] *= (1 + la*rho)
@@ -57,7 +61,7 @@ def calc_risk_adj_kelly(ev_percent: float, variance: float, risk_scale: float = 
     ev = ev_percent / 100.0
     f = (ev / variance) * risk_scale
     cap = 0.5
-    if prob < 0.35: cap = 0.02
+    if prob < 0.35: cap = 0.025 # 冷門保護
     return min(cap, max(0.0, f)) * 100
 
 def calc_risk_metrics(prob: float, odds: float) -> Tuple[float, float]:
@@ -71,78 +75,42 @@ def calc_risk_metrics(prob: float, odds: float) -> Tuple[float, float]:
     sharpe = expected_val / std_dev if std_dev > 0 else 0
     return variance, sharpe
 
-def get_true_implied_prob(odds_dict: Dict[str, float]) -> Dict[str, float]:
-    inv = {}
-    for k, v in odds_dict.items():
-        try:
-            inv[k] = 1.0 / float(v) if v and float(v) > 0 else 0.0
-        except:
-            inv[k] = 0.0
-    margin = sum(inv.values())
-    if margin <= 0:
-        return {k: 0.0 for k in odds_dict}
-    return {k: inv[k] / margin for k in odds_dict}
-
 # =========================
-# 2. 全景記憶體系
+# 2. 全景記憶體系 (Regime Memory)
 # =========================
 class RegimeMemory:
     def __init__(self):
         self.history_db = {
-            "Bore_Draw_Stalemate": { "name": "🛡️ 雙重鐵桶 (悶和局)", "bets": 19, "roi": 0.219 }, 
-            "Relegation_Dog": { "name": "🐕 保級受讓 (絕境爆發)", "bets": 101, "roi": 0.083 },
-            "Fallen_Giant": { "name": "📉 豪門崩盤 (名氣大狀況差)", "bets": 67, "roi": -0.008 },
-            "Fortress_Home": { "name": "🏰 魔鬼主場 (主場過熱)", "bets": 256, "roi": -0.008 },
-            "Counter_Away_Dog": { "name": "⚡ 客隊防反 (偷襲得手)", "bets": 90, "roi": 0.010 },
-            "MidTable_Standard": { "name": "😐 中游例行公事", "bets": 300, "roi": 0.000 },
-            "Title_MustWin_Home": { "name": "🏆 爭冠必勝盤 (溢價陷阱)", "bets": 256, "roi": -0.063 },
-            "Injury_Crisis_Fav": { "name": "🏥 傷兵詛咒 (無力回天)", "bets": 37, "roi": -0.099 },
-            "Hidden_Gem_Dog": { "name": "🦊 扮豬吃老虎 (數據失靈)", "bets": 6, "roi": -0.117 },
-            "MarketHype_Fav": { "name": "🔥 大熱倒灶 (過度熱門)", "bets": 150, "roi": -0.080 },
-            "HeavyFav_DeepBlock": { "name": "⚠️ 強隊遇鐵桶陣", "bets": 50, "roi": -0.120 }
+            "Bore_Draw_Stalemate": { "name": "🛡️ 雙重鐵桶 (悶和局)", "roi": 0.219 }, 
+            "Relegation_Dog": { "name": "🐕 保級受讓 (絕境爆發)", "roi": 0.083 },
+            "Fallen_Giant": { "name": "📉 豪門崩盤 (名氣大狀況差)", "roi": -0.008 },
+            "Fortress_Home": { "name": "🏰 魔鬼主場 (主場過熱)", "roi": -0.008 },
+            "Title_MustWin_Home": { "name": "🏆 爭冠必勝盤 (溢價陷阱)", "roi": -0.063 },
+            "MarketHype_Fav": { "name": "🔥 大熱倒灶 (過度熱門)", "roi": -0.080 },
+            "MidTable_Standard": { "name": "😐 中游例行公事", "roi": 0.000 }
         }
 
-    def analyze_scenario(self, engine: 'SniperAnalystLogic', lh: float, la: float) -> str:
-        h, a = engine.h, engine.a
-        odds = engine.market["1x2_odds"]
-        prob_h = 1.0 / odds["home"]
-        h_odds = odds["home"]
-        is_heavy_fav = prob_h > 0.65
-        is_underdog = prob_h < 0.35
-        motiv_h = h["context_modifiers"]["motivation"]
-        motiv_a = a["context_modifiers"]["motivation"]
-        form_h_score = sum(h["context_modifiers"].get("recent_form_trend", [0]))
-        form_a_score = sum(a["context_modifiers"].get("recent_form_trend", [0]))
-        is_title_race = (motiv_h == "title_race")
-        is_relegation = (motiv_h == "survival" or motiv_a == "survival")
+    def analyze_scenario(self, lh: float, la: float, odds: Dict) -> str:
+        h_odds = odds.get("home", 2.0)
+        prob_h = 1.0 / h_odds
         
-        if h_odds < 2.10 and form_h_score < -1: return "Fallen_Giant"
-        if is_heavy_fav and form_h_score < 0: return "Injury_Crisis_Fav"
-        if is_title_race and is_heavy_fav: return "Title_MustWin_Home"
-        if is_relegation and is_underdog: return "Relegation_Dog"
-        
-        h_adv = h["general_strength"].get("home_advantage_weight", 1.15)
-        if h_adv > 1.15 and h_odds < 2.0 and form_h_score >= 1: return "Fortress_Home"
-        
-        if is_underdog and form_h_score > (form_a_score + 2): return "Hidden_Gem_Dog"
         if h_odds < 1.30: return "MarketHype_Fav"
-        if (lh + la) < 2.2 and abs(form_h_score) < 2 and abs(form_a_score) < 2: return "Bore_Draw_Stalemate"
+        if (lh + la) < 2.0: return "Bore_Draw_Stalemate"
+        if prob_h > 0.6 and h_odds > 1.8: return "Fallen_Giant"
         return "MidTable_Standard"
 
-    def recall_experience(self, regime_id: str) -> Dict:
-        return self.history_db.get(regime_id, {"name": "🔍 未知盤口", "bets": 0, "roi": 0.0})
-
-    def calc_memory_penalty(self, historical_roi: float) -> float:
-        if historical_roi < -0.10: return 0.5
-        if historical_roi < -0.05: return 0.7
-        if historical_roi > 0.15: return 1.2
-        if historical_roi > 0.05: return 1.1
+    def calc_memory_penalty(self, regime_id: str) -> float:
+        data = self.history_db.get(regime_id, {"roi": 0})
+        roi = data["roi"]
+        # V33: 更平滑的懲罰係數
+        if roi < -0.05: return 0.8
+        if roi > 0.10: return 1.15
         return 1.0
 
 # =========================
-# 3. 分析引擎邏輯 (Logic Core - V32.0 邏輯升級)
+# 3. 分析引擎邏輯 (V33.0 Lite Core)
 # =========================
-class SniperAnalystLogic:
+class SniperAnalystLogicV33:
     def __init__(self, json_data: Any, max_g: int = 9, nb_alpha: float = 0.12):
         self.data = json_data if isinstance(json_data, dict) else json.loads(json_data)
         self.h = self.data["home"]
@@ -152,486 +120,336 @@ class SniperAnalystLogic:
         self.nb_alpha = nb_alpha
         self.memory = RegimeMemory()
 
-    def calc_lambda(self) -> Tuple[float, float]:
-        league_base = 1.35
-        def att_def(team):
+    def calc_weighted_lambda(self) -> Tuple[float, float]:
+        """[V33.0] 近況加權 Lambda 計算"""
+        league_base = 1.35 # 聯賽平均基準
+        
+        # 1. 基礎數據
+        def get_base_att_def(team):
             xg = team["offensive_stats"].get("xg_avg", team["offensive_stats"]["goals_scored_avg"])
             xga = team["defensive_stats"].get("xga_avg", team["defensive_stats"]["goals_conceded_avg"])
-            att = 0.4 * team["offensive_stats"]["goals_scored_avg"] + 0.6 * xg
-            deff = 0.4 * team["defensive_stats"]["goals_conceded_avg"] + 0.6 * xga
+            # V33: xG 權重提高到 70% (比進球數更準)
+            att = 0.3 * team["offensive_stats"]["goals_scored_avg"] + 0.7 * xg
+            deff = 0.3 * team["defensive_stats"]["goals_conceded_avg"] + 0.7 * xga
             return att, deff
 
-        h_att, h_def = att_def(self.h)
-        a_att, a_def = att_def(self.a)
+        h_att, h_def = get_base_att_def(self.h)
+        a_att, a_def = get_base_att_def(self.a)
         
-        if self.h["context_modifiers"].get("missing_key_defender", False): h_def *= 1.20
-        if self.a["context_modifiers"].get("missing_key_defender", False): a_def *= 1.15
+        # 2. Time-Decay (近況加權)
+        # 解析 recent_form_trend (例如 [1, 0, -1]) -> 權重微調
+        def get_form_factor(trend):
+            if not trend: return 1.0
+            # 越後面的 index 代表越近期的比賽
+            # 權重: 最遠(0.1), 中間(0.3), 最近(0.6)
+            w = np.linspace(0.1, 0.9, len(trend))
+            w /= w.sum()
+            score = np.dot(np.array(trend), w) # score 介於 -1 ~ 1
+            return 1.0 + (score * 0.1) # 波動範圍 +/- 10%
+
+        h_form = get_form_factor(self.h["context_modifiers"].get("recent_form_trend", []))
+        a_form = get_form_factor(self.a["context_modifiers"].get("recent_form_trend", []))
         
+        h_att *= h_form
+        a_att *= a_form
+
+        # 3. 傷停修正
+        if self.h["context_modifiers"].get("missing_key_defender", False): h_def *= 1.25
+        if self.a["context_modifiers"].get("missing_key_defender", False): a_def *= 1.20
+        
+        # 4. 主場優勢
         h_adv = self.h["general_strength"].get("home_advantage_weight", 1.15)
         
+        # 5. 最終合成
         lh = (h_att * a_def / league_base) * h_adv
         la = (a_att * h_def / league_base)
         
-        if self.h["context_modifiers"]["motivation"] == "survival": lh *= 1.05
-        if self.a["context_modifiers"]["motivation"] == "title_race": la *= 1.05
         return lh, la
 
-    def get_market_trend_bonus(self) -> Dict[str, float]:
-        bonus = {"home":0.0, "draw":0.0, "away":0.0}
-        op = self.market.get("opening_odds")
-        cu = self.market.get("1x2_odds")
-        if not op or not cu: return bonus
-        for k in bonus:
-            drop = max(0.0, (op[k] - cu[k]) / op[k])
-            bonus[k] = min(3.0, drop * 30.0)
-        return bonus
-
-    def build_ensemble_matrix(self, lh: float, la: float) -> np.ndarray:
+    def build_hybrid_matrix(self, lh: float, la: float) -> Tuple[np.ndarray, Dict]:
+        """
+        [V33.0 核心] 混合矩陣 (Stacking Matrix)
+        先生成物理模型矩陣，再根據市場賠率進行權重再平衡 (Rebalancing)。
+        """
+        # 1. 建立物理模型矩陣 (Base Model Matrix)
         vol_str = self.h.get("style_of_play", {}).get("volatility", "normal")
         vol_adjust = (vol_str == "high")
-        return get_matrix_cached(lh, la, self.max_g, self.nb_alpha, vol_adjust)
+        M_model = get_base_matrix(lh, la, self.max_g, self.nb_alpha, vol_adjust)
+        
+        # 2. 獲取市場隱含機率 (去水)
+        odds = self.market["1x2_odds"]
+        imp_h = implied_prob(odds["home"])
+        imp_d = implied_prob(odds["draw"])
+        imp_a = implied_prob(odds["away"])
+        total_imp = imp_h + imp_d + imp_a
+        
+        # 歸一化市場機率
+        market_probs = {
+            "home": imp_h / total_imp,
+            "draw": imp_d / total_imp,
+            "away": imp_a / total_imp
+        }
+        
+        # 3. 計算模型原始機率
+        model_h = float(np.sum(np.tril(M_model, -1)))
+        model_d = float(np.sum(np.diag(M_model)))
+        model_a = float(np.sum(np.triu(M_model, 1)))
+        
+        # 4. 混合 (Blending) - 權重設定
+        # V33 策略：模型 70% (相信數據) + 市場 30% (尊重莊家)
+        w_model = 0.7
+        target_h = w_model * model_h + (1 - w_model) * market_probs["home"]
+        target_d = w_model * model_d + (1 - w_model) * market_probs["draw"]
+        target_a = w_model * model_a + (1 - w_model) * market_probs["away"]
+        
+        # 5. 矩陣再平衡 (Rebalancing)
+        # 將矩陣的三個區域 (下三角、對角線、上三角) 縮放至目標機率
+        M_hybrid = M_model.copy()
+        
+        # 縮放因子
+        scale_h = target_h / model_h if model_h > 0 else 0
+        scale_d = target_d / model_d if model_d > 0 else 0
+        scale_a = target_a / model_a if model_a > 0 else 0
+        
+        # 應用縮放
+        idx_h = np.tril_indices(self.max_g, -1)
+        idx_d = np.diag_indices(self.max_g)
+        idx_a = np.triu_indices(self.max_g, 1)
+        
+        M_hybrid[idx_h] *= scale_h
+        M_hybrid[idx_d] *= scale_d
+        M_hybrid[idx_a] *= scale_a
+        
+        # 再次歸一化以防誤差
+        M_hybrid /= M_hybrid.sum()
+        
+        return M_hybrid, {
+            "model": {"home": model_h, "draw": model_d, "away": model_a},
+            "market": market_probs,
+            "target": {"home": target_h, "draw": target_d, "away": target_a}
+        }
 
     def ah_ev(self, M: np.ndarray, hcap: float, odds: float) -> float:
-        """
-        [V32.0 升級] 亞盤 Quarter Split (四分盤) 精確計算邏輯
-        """
-        # 1. 檢查是否為四分盤 (如 -0.75, +0.25)
-        # 0.75 * 4 = 3 (奇數), 0.5 * 4 = 2 (偶數)
+        """亞盤四分盤計算 (直接使用混合後的矩陣)"""
         q = int(round(hcap * 4))
+        if q % 2 != 0: # Quarter split
+            h1 = (q + 1) / 4.0; h2 = (q - 1) / 4.0
+            return 0.5 * self.ah_ev(M, h1, odds) + 0.5 * self.ah_ev(M, h2, odds)
         
-        if q % 2 != 0:
-            # Quarter Split: 拆分成兩個盤口計算
-            # 例: -0.75 (q=-3) -> -0.5 (q=-2) 和 -1.0 (q=-4)
-            h1 = (q + 1) / 4.0
-            h2 = (q - 1) / 4.0
-            ev1 = self.ah_ev(M, h1, odds)
-            ev2 = self.ah_ev(M, h2, odds)
-            return 0.5 * ev1 + 0.5 * ev2
-        
-        # 2. 標準盤口 (整數盤或半球盤)
         G = self.max_g
         idx_diff = np.subtract.outer(np.arange(G), np.arange(G)) 
         r_matrix = idx_diff + hcap
-        
-        # 精確的派彩矩陣
         payoff = np.select(
             [r_matrix > 0.001, np.abs(r_matrix) <= 0.001, r_matrix < -0.001],
-            [odds - 1, 0, -1], # 贏, 走盤, 輸
-            default=-1
+            [odds - 1, 0, -1], default=-1
         )
-        
-        ev = np.sum(M * payoff)
-        return ev * 100
+        return np.sum(M * payoff) * 100
 
-    def run_monte_carlo(self, M: np.ndarray, sims: int = 10000, seed: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray, List[str]]:
-        """
-        [V32.0 升級] 基於聯合分佈 (Joint Distribution) 的抽樣
-        - 確保模擬結果與波膽矩陣 M 完全一致
-        - 不再使用獨立 Poisson 抽樣，捕捉相關性修正
-        """
-        rng = np.random.default_rng(seed)
-        G = M.shape[0]
-        
-        # 1. 將矩陣攤平為機率向量
+    def run_monte_carlo(self, M: np.ndarray, sims: int = 5000) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+        """從混合矩陣進行聯合抽樣"""
         flat_M = M.flatten()
-        flat_M = flat_M / flat_M.sum() # 確保總和為 1
-        
-        # 2. 從聯合分佈中抽取索引
-        indices = rng.choice(G * G, size=sims, p=flat_M)
-        
-        # 3. 還原為主客進球數
-        home_goals = indices // G
-        away_goals = indices % G
-        
-        # 4. 判斷勝負
-        diff = home_goals - away_goals
+        flat_M /= flat_M.sum()
+        rng = np.random.default_rng(42)
+        indices = rng.choice(M.shape[0]**2, size=sims, p=flat_M)
+        h_goals = indices // M.shape[0]
+        a_goals = indices % M.shape[0]
         results = np.full(sims, "draw", dtype=object)
-        results[diff > 0] = "home"
-        results[diff < 0] = "away"
-        
-        return home_goals, away_goals, results.tolist()
-
-    def check_sensitivity(self, lh: float, la: float) -> Tuple[str, float]:
-        M_stress = get_matrix_cached(lh, la + 0.3, self.max_g, self.nb_alpha, False)
-        M_orig = self.build_ensemble_matrix(lh, la)
-        prob_h_orig = float(np.sum(np.tril(M_orig, -1)))
-        prob_h_new = float(np.sum(np.tril(M_stress, -1)))
-        
-        drop_rate = (prob_h_orig - prob_h_new) / prob_h_orig if prob_h_orig > 0 else 0
-        level = "Low"
-        if drop_rate > 0.15: level = "High"
-        elif drop_rate > 0.08: level = "Medium"
-        return level, drop_rate
-
-    def calc_model_confidence(self, lh: float, la: float, market_diff_percent: float, sens_drop_rate: float) -> Tuple[float, List[str]]:
-        """[V32.0] 使用相對差異作為信心指標"""
-        score = 1.0
-        reasons = []
-        
-        # 門檻調整適應百分比差異
-        if market_diff_percent > 0.25:
-            score *= 0.7; reasons.append(f"與市場差異過大 ({market_diff_percent:.1%})")
-        elif market_diff_percent > 0.15:
-            score *= 0.85; reasons.append(f"與市場顯著分歧 ({market_diff_percent:.1%})")
-        
-        if sens_drop_rate > 0.15:
-            score *= 0.8; reasons.append("模型對運氣球極度敏感")
-        elif sens_drop_rate > 0.08:
-            score *= 0.9; reasons.append("敏感度偏高")
-            
-        total_xg = lh + la
-        if total_xg > 3.5:
-            score *= 0.9; reasons.append("高入球預期 (亂戰風險)")
-            
-        return score, reasons
+        results[h_goals > a_goals] = "home"
+        results[h_goals < a_goals] = "away"
+        return h_goals, a_goals, results.tolist()
 
 # =========================
-# 4. Streamlit UI 介面 (V32.0)
+# 4. Streamlit UI (V33.0 Lite)
 # =========================
-st.set_page_config(page_title="狙擊手 V32.0 (邏輯修正版)", page_icon="⚽", layout="wide")
+st.set_page_config(page_title="狙擊手 V33.0 Lite", page_icon="🎯", layout="wide")
 
-st.title("⚽ 狙擊手 V32.0 (邏輯修正版)")
-st.markdown("### 修正重點：AH四分盤分拆 / 聯合分佈MC抽樣 / Lgamma穩定性")
+st.markdown("""
+<style>
+    .big-font { font-size:24px !important; font-weight: bold; }
+    .metric-card { background-color: #f0f2f6; padding: 15px; border-radius: 10px; border-left: 5px solid #ff4b4b; }
+</style>
+""", unsafe_allow_html=True)
 
-if "analysis_results" not in st.session_state:
-    st.session_state.analysis_results = None
+st.title("🎯 狙擊手 V33.0 Lite (實戰混合版)")
+st.markdown("**核心升級**：Hybrid Matrix (市場權重疊加) | Time-Decay (近況加權) | Dynamic Kelly")
 
+# Session State 初始化
+if "v33_result" not in st.session_state:
+    st.session_state.v33_result = None
+
+# --- 側邊欄 ---
 with st.sidebar:
-    st.header("⚙️ 參數設定")
-    unit_stake = st.number_input("💰 設定單注本金 ($)", min_value=10, value=100, step=10)
+    st.header("⚙️ 參數控制")
+    unit_stake = st.number_input("單注本金 ($)", 100, 10000, 100)
+    risk_scale = st.slider("風險係數 (Risk Scale)", 0.1, 1.0, 0.4, 0.05)
+    nb_alpha = st.slider("Alpha (變異數)", 0.05, 0.25, 0.12, 0.01)
     st.divider()
-    nb_alpha = st.slider("Alpha (變異數)", 0.05, 0.20, 0.12, 0.01)
-    max_g = st.number_input("運算範圍 (max_g)", 5, 20, 9)
-    risk_scale = st.slider("風險縮放係數", 0.1, 1.0, 0.3, 0.1)
-    st.divider()
-    enable_fixed_seed = st.toggle("固定隨機數種子 (除錯/回測用)", value=True)
-    seed_val = 42 if enable_fixed_seed else None
-    use_mock_memory = st.checkbox("🧠 啟用歷史記憶 (真實回測數據)", value=True)
+    st.info("V33.0 自動啟用市場混合模式 (Model 70% + Market 30%)")
 
-st.info("請選擇數據輸入方式：")
-tab_input1, tab_input2 = st.tabs(["📋 貼上 JSON 代碼", "📂 上傳 JSON 檔案"])
-input_data = None
-
+# --- 數據輸入區 ---
+st.info("請輸入比賽數據 JSON")
 default_json = """{
-  "meta_info": { "league_name": "範例聯賽", "match_date": "2026-03-11" },
+  "meta_info": { "league_name": "英超", "match_date": "2026-03-12" },
   "market_data": {
-    "handicaps": [-0.75, 0.25],
+    "handicaps": [-0.5, 0],
     "goal_lines": [2.5, 3.0],
-    "target_odds": 1.90,
-    "1x2_odds": { "home": 1.72, "draw": 4.00, "away": 4.00 },
-    "opening_odds": { "home": 3.20, "draw": 3.60, "away": 2.20 }
+    "target_odds": 1.95,
+    "1x2_odds": { "home": 2.10, "draw": 3.40, "away": 3.40 },
+    "opening_odds": { "home": 2.20, "draw": 3.30, "away": 3.20 }
   },
   "home": {
-    "name": "主隊範例",
-    "general_strength": { "home_advantage_weight": 1.25 },
-    "offensive_stats": { "goals_scored_avg": 1.57, "xg_avg": 1.6 },
-    "defensive_stats": { "goals_conceded_avg": 1.0, "xga_avg": 0.95 },
+    "name": "主隊 (強勢)",
+    "general_strength": { "home_advantage_weight": 1.20 },
+    "offensive_stats": { "goals_scored_avg": 1.8, "xg_avg": 1.9 },
+    "defensive_stats": { "goals_conceded_avg": 1.1, "xga_avg": 1.0 },
     "style_of_play": { "volatility": "normal" },
-    "context_modifiers": { "motivation": "title_race", "missing_key_defender": false, "recent_form_trend": [1, 0, -1] }
+    "context_modifiers": { "motivation": "normal", "missing_key_defender": false, "recent_form_trend": [1, 1, 0] }
   },
   "away": {
-    "name": "客隊範例",
-    "general_strength": { "home_advantage_weight": 0.80 },
-    "offensive_stats": { "goals_scored_avg": 0.80, "xg_avg": 0.9 },
-    "defensive_stats": { "goals_conceded_avg": 1.33, "xga_avg": 1.5 },
+    "name": "客隊 (低迷)",
+    "general_strength": { "home_advantage_weight": 0.9 },
+    "offensive_stats": { "goals_scored_avg": 1.0, "xg_avg": 0.9 },
+    "defensive_stats": { "goals_conceded_avg": 1.5, "xga_avg": 1.6 },
     "style_of_play": { "volatility": "high" },
-    "context_modifiers": { "motivation": "survival", "missing_key_defender": true, "recent_form_trend": [-1, 1, -1] }
+    "context_modifiers": { "motivation": "survival", "missing_key_defender": true, "recent_form_trend": [-1, -1, 0] }
   }
 }"""
+json_input = st.text_area("JSON Input", value=default_json, height=200)
 
-with tab_input1:
-    json_text = st.text_area("在此貼上 JSON", value=default_json, height=150)
-    if json_text:
-        try: input_data = json.loads(json_text)
-        except: st.error("JSON 格式錯誤")
-with tab_input2:
-    uploaded_file = st.file_uploader("選擇 .json 或 .txt 檔案", type=['json', 'txt'])
-    if uploaded_file:
-        try: input_data = json.load(uploaded_file)
-        except: st.error("檔案讀取失敗")
-
-if st.button("🚀 開始全方位分析", type="primary"):
-    if not input_data:
-        st.error("請先輸入有效的比賽數據！")
-    else:
-        if "recent_form_trend" not in input_data["home"]["context_modifiers"]:
-            input_data["home"]["context_modifiers"]["recent_form_trend"] = [0,0,0]
-        if "recent_form_trend" not in input_data["away"]["context_modifiers"]:
-            input_data["away"]["context_modifiers"]["recent_form_trend"] = [0,0,0]
-
-        engine = SniperAnalystLogic(input_data, max_g, nb_alpha)
+if st.button("🚀 啟動 V33.0 混合運算", type="primary"):
+    try:
+        input_data = json.loads(json_input)
+        engine = SniperAnalystLogicV33(input_data, max_g=9, nb_alpha=nb_alpha)
         
-        lh, la = engine.calc_lambda()
-        M = engine.build_ensemble_matrix(lh, la)
-        market_bonus = engine.get_market_trend_bonus()
-        true_imp_probs = get_true_implied_prob(engine.market["1x2_odds"])
+        # 1. 計算加權 Lambda
+        lh, la = engine.calc_weighted_lambda()
         
-        regime_id = engine.memory.analyze_scenario(engine, lh, la)
-        history_data = {"name": "未知", "bets": 0, "roi": 0.0}
-        memory_penalty = 1.0
+        # 2. 構建混合矩陣 (Hybrid Matrix)
+        M_hybrid, probs_info = engine.build_hybrid_matrix(lh, la)
         
-        if use_mock_memory:
-            history_data = engine.memory.recall_experience(regime_id)
-            memory_penalty = engine.memory.calc_memory_penalty(history_data["roi"])
-
-        # [V32.0] 相對差異計算
-        prob_h = float(np.sum(np.tril(M, -1)))
-        market_prob_h = true_imp_probs.get("home", 1e-9)
-        market_diff_percent = abs(prob_h - market_prob_h) / max(market_prob_h, 1e-9)
+        # 3. 記憶體系回溯
+        regime_id = engine.memory.analyze_scenario(lh, la, engine.market["1x2_odds"])
+        mem_penalty = engine.memory.calc_memory_penalty(regime_id)
         
-        sens_level, sens_drop = engine.check_sensitivity(lh, la)
-        model_conf_score, conf_reasons = engine.calc_model_confidence(lh, la, market_diff_percent, sens_drop)
-        
-        st.session_state.analysis_results = {
+        st.session_state.v33_result = {
             "engine": engine,
-            "M": M,
-            "lh": lh,
-            "la": la,
-            "market_bonus": market_bonus,
-            "true_imp_probs": true_imp_probs,
-            "history_data": history_data,
-            "memory_penalty": memory_penalty,
-            "model_conf_score": model_conf_score,
-            "prob_h": prob_h
+            "M": M_hybrid,
+            "lh": lh, "la": la,
+            "probs_info": probs_info,
+            "regime": regime_id,
+            "mem_penalty": mem_penalty
         }
+    except Exception as e:
+        st.error(f"運算錯誤: {e}")
 
-if st.session_state.analysis_results:
-    res = st.session_state.analysis_results
+# --- 結果顯示區 ---
+if st.session_state.v33_result:
+    res = st.session_state.v33_result
     engine = res["engine"]
     M = res["M"]
-    history_data = res["history_data"]
+    probs = res["probs_info"]
     
-    with st.sidebar:
-        st.divider()
-        st.subheader("🧠 盤口劇本識別")
-        st.info(f"{history_data['name']}")
-        
-        if use_mock_memory:
-            col_h1, col_h2 = st.columns(2)
-            col_h1.metric("歷史樣本", f"{history_data['bets']}場")
-            col_h2.metric("歷史 ROI", f"{history_data['roi']*100:.1f}%", delta_color="normal" if history_data['roi'] > 0 else "inverse")
-            
-            penalty = res["memory_penalty"]
-            if penalty < 1.0: st.error(f"⚠️ 歷史虧損懲罰: EV x {penalty}")
-            elif penalty > 1.0: st.success(f"🔥 歷史獲利加成: EV x {penalty}")
-        else: st.caption("記憶模擬未啟用")
+    # 頂部儀表板
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("主隊預期進球", f"{res['lh']:.2f}")
+    c2.metric("客隊預期進球", f"{res['la']:.2f}")
+    c3.metric("盤口劇本", res["regime"])
+    c4.metric("歷史權重修正", f"x{res['mem_penalty']:.2f}")
 
-        st.divider()
-        st.subheader("🛡️ 模型信心")
-        st.metric("Confidence", f"{res['model_conf_score']*100:.0f}/100")
+    # 混合概率視覺化
+    st.subheader("⚖️ Model vs Market 混合權重分析")
+    mix_df = pd.DataFrame([
+        probs["model"], probs["market"], probs["target"]
+    ], index=["純模型 (Physics)", "純市場 (Implied)", "V33 混合 (Hybrid)"])
+    st.dataframe(mix_df.style.format("{:.1%}"), use_container_width=True)
+    
+    if abs(probs["model"]["home"] - probs["market"]["home"]) > 0.15:
+        st.warning("⚠️ 警告：模型與市場分歧嚴重，V33 已自動進行權重收斂 (Rebalancing)")
+    else:
+        st.success("✅ 模型與市場觀點大致相符，信心度高")
 
-    col1, col2, col3 = st.columns([1, 0.2, 1])
-    with col1:
-        st.markdown(f"<h3 style='text-align: right; color: #1f77b4;'>{engine.h['name']}</h3>", unsafe_allow_html=True)
-        st.metric("預期進球", f"{res['lh']:.2f}")
-    with col2: st.markdown("<h3 style='text-align: center;'>VS</h3>", unsafe_allow_html=True)
-    with col3:
-        st.markdown(f"<h3 style='text-align: left; color: #ff7f0e;'>{engine.a['name']}</h3>", unsafe_allow_html=True)
-        st.metric("預期進球", f"{res['la']:.2f}")
-
-    prob_d = float(np.sum(np.diag(M)))
-    prob_a = float(np.sum(np.triu(M, 1)))
-    prob_h = res["prob_h"]
-
-    res_tab1, res_tab2, res_tab3, res_tab4 = st.tabs(["📊 價值與劇本修正", "🧠 智能裁決", "🎯 波膽分佈", "🎲 模擬與雷達"])
-
+    # 投資分析 Tab
+    tab_ev, tab_sim = st.tabs(["💰 價值注單 (EV)", "🎲 戰局模擬"])
+    
     candidates = []
-
-    with res_tab1:
-        st.subheader("💰 獨贏 (1x2)")
-        rows_1x2 = []
-        for tag, prob, key in [("主勝", prob_h, "home"), ("和局", prob_d, "draw"), ("客勝", prob_a, "away")]:
-            odd = engine.market["1x2_odds"][key]
-            raw_ev = (prob * odd - 1) * 100 + res["market_bonus"][key]
-            adj_ev = raw_ev * res["model_conf_score"] * res["memory_penalty"]
-            
-            var, sharpe = calc_risk_metrics(prob, odd)
-            kelly_pct = calc_risk_adj_kelly(adj_ev, var, risk_scale, prob)
-            profit = (odd - 1) * unit_stake
-            
-            note = ""
-            if prob < 0.35 and adj_ev > 0: note = "⚠️ 冷門小注"
-            
-            rows_1x2.append({
-                "選項": tag, "賠率": odd, 
-                "原始 EV": f"{raw_ev:+.1f}%",
-                "修正 EV": f"{adj_ev:+.1f}%",
-                "預計獲利": f"${profit:.1f}",
-                "夏普值": f"{sharpe:.2f}",
-                "建議注碼%": f"{kelly_pct:.1f}%",
-                "備註": note
-            })
-            if adj_ev > 1.5:
-                candidates.append({
-                    "type":"1x2", "pick":tag, "ev":adj_ev, "raw_ev":raw_ev,
-                    "odds":odd, "prob":prob, "sens": "Low",
-                    "sharpe": sharpe, "kelly": kelly_pct, "note": note
-                })
-        st.dataframe(pd.DataFrame(rows_1x2), use_container_width=True)
-
-        c_ah, c_ou = st.columns(2)
-        with c_ah:
-            st.subheader("🛡️ 亞盤 (Split計算)")
-            d_ah = []
-            target_o = engine.market.get("target_odds", 1.90)
-            
-            for hcap in engine.market["handicaps"]:
-                raw_ev = engine.ah_ev(M, hcap, target_o) + res["market_bonus"]["home"]
-                adj_ev = raw_ev * res["model_conf_score"] * res["memory_penalty"]
-                
-                prob_approx = (raw_ev/100.0 + 1) / target_o
-                var, sharpe = calc_risk_metrics(prob_approx, target_o)
-                kelly_pct = calc_risk_adj_kelly(adj_ev, var, risk_scale, prob_approx)
-                profit = (target_o - 1) * unit_stake
-
-                d_ah.append({
-                    "盤口": f"主 {hcap:+}", "賠率": target_o, 
-                    "修正 EV": f"{adj_ev:+.1f}%", "預計獲利": f"${profit:.1f}",
-                    "夏普值": f"{sharpe:.2f}", "建議注碼%": f"{kelly_pct:.1f}%"
-                })
-                if adj_ev > 2: 
-                    candidates.append({
-                        "type":"AH", "pick":f"主 {hcap:+}", "ev":adj_ev, "raw_ev":raw_ev,
-                        "odds":target_o, "prob":prob_approx, "sens":"Medium",
-                        "sharpe": sharpe, "kelly": kelly_pct, "note": ""
-                    })
-            st.dataframe(pd.DataFrame(d_ah), use_container_width=True)
+    
+    with tab_ev:
+        col_main, col_ah = st.columns([1.2, 1])
         
-        with c_ou:
-            st.subheader("📐 大小球 (雙向)")
-            d_ou = []
+        with col_main:
+            st.markdown("#### 1x2 獨贏 (Hybrid EV)")
+            rows_1x2 = []
+            for tag, key in [("主勝", "home"), ("和局", "draw"), ("客勝", "away")]:
+                prob = probs["target"][key] # 使用混合後的機率
+                odds = engine.market["1x2_odds"][key]
+                ev = (prob * odds - 1) * 100 * res["mem_penalty"]
+                
+                var, sharpe = calc_risk_metrics(prob, odds)
+                kelly = calc_risk_adj_kelly(ev, var, risk_scale, prob)
+                
+                rows_1x2.append({"選項": tag, "賠率": odds, "機率": f"{prob:.1%}", "修正EV": f"{ev:+.1f}%", "注碼": f"{kelly:.1f}%"})
+                if ev > 1.5:
+                    candidates.append({"pick": tag, "ev": ev, "kelly": kelly, "odds": odds, "type": "1x2"})
             
+            st.dataframe(pd.DataFrame(rows_1x2), use_container_width=True)
+
+        with col_ah:
+            st.markdown("#### 亞盤 & 大小 (Matrix Derived)")
+            rows_sub = []
+            target_o = engine.market.get("target_odds", 1.95)
+            
+            # AH
+            for hcap in engine.market["handicaps"]:
+                ev = engine.ah_ev(M, hcap, target_o) * res["mem_penalty"]
+                rows_sub.append({"盤口": f"主 {hcap:+}", "EV": f"{ev:+.1f}%"})
+                if ev > 2.0:
+                    candidates.append({"pick": f"主 {hcap:+}", "ev": ev, "kelly": calc_risk_adj_kelly(ev, 1.0, risk_scale, 0.5), "odds": target_o, "type": "AH"})
+            
+            # OU
             G = engine.max_g
             idx_sum = np.add.outer(np.arange(G), np.arange(G))
-            target_o = engine.market.get("target_odds", 1.90)
-
             for line in engine.market["goal_lines"]:
                 prob_over = float(M[idx_sum > line].sum())
-                prob_under = float(M[idx_sum < line].sum())
-                
-                for side_label, op, pick_name in [("大", prob_over, f"大 {line}"), ("小", prob_under, f"小 {line}")]:
-                    raw_ev = (op * target_o - 1) * 100
-                    adj_ev = raw_ev * res["model_conf_score"] * res["memory_penalty"]
-                    
-                    var, sharpe = calc_risk_metrics(op, target_o)
-                    kelly_pct = calc_risk_adj_kelly(adj_ev, var, risk_scale, op)
-                    profit = (target_o - 1) * unit_stake
-
-                    d_ou.append({
-                        "盤口": pick_name, "賠率": target_o, 
-                        "修正 EV": f"{adj_ev:+.1f}%", "預計獲利": f"${profit:.1f}",
-                        "夏普值": f"{sharpe:.2f}", "建議注碼%": f"{kelly_pct:.1f}%"
-                    })
-                    
-                    if adj_ev > 2: 
-                        candidates.append({
-                            "type":"OU", "pick":pick_name, "ev":adj_ev, "raw_ev":raw_ev,
-                            "odds":target_o, "prob":op, "sens":"Medium",
-                            "sharpe": sharpe, "kelly": kelly_pct, "note": ""
-                        })
-                        
-            st.dataframe(pd.DataFrame(d_ou), use_container_width=True)
-
-        st.subheader("📝 智能投資組合 (劇本加權)")
-        if candidates:
-            final = sorted(candidates, key=lambda x:x["ev"], reverse=True)[:3]
-            no_bet_flag = False; no_bet_reason = []
+                ev_over = (prob_over * target_o - 1) * 100 * res["mem_penalty"]
+                rows_sub.append({"盤口": f"大 {line}", "EV": f"{ev_over:+.1f}%"})
+                if ev_over > 2.0:
+                    candidates.append({"pick": f"大 {line}", "ev": ev_over, "kelly": calc_risk_adj_kelly(ev_over, 1.0, risk_scale, prob_over), "odds": target_o, "type": "OU"})
             
-            if use_mock_memory and history_data['roi'] < -0.05:
-                    no_bet_flag = True
-                    no_bet_reason.append(f"劇本警示：此劇本 ({history_data['name']}) 歷史為負期望值，建議避開")
+            st.dataframe(pd.DataFrame(rows_sub), use_container_width=True)
 
-            if res["model_conf_score"] < 0.6:
-                no_bet_flag = True; no_bet_reason.append(f"模型信心過低 ({res['model_conf_score']*100:.0f}/100)")
-            
-            if no_bet_flag:
-                st.error(f"🛑 系統建議觀望 (NO BET)")
-                for r in no_bet_reason: st.write(f"- {r}")
-            else:
-                reco = []
-                for p in final:
-                    bet_amount = unit_stake * (p['kelly'] / 10.0)
-                    risk_icon = "🟢" if p['sharpe'] > 0.1 else ("🟡" if p['sharpe'] > 0.05 else "🔴")
-                    reco.append([
-                        f"[{p['type']}] {p['pick']}", p['odds'], 
-                        f"{p['raw_ev']:+.1f}%", f"{p['ev']:+.1f}%",      
-                        f"{risk_icon} {p['sharpe']:.3f}", 
-                        f"{p['kelly']:.1f}%", f"${bet_amount:.1f}",
-                        p['note']
-                    ])
-                st.dataframe(pd.DataFrame(reco, columns=["選項", "賠率", "原始EV", "修正EV", "夏普值", "注碼%", "建議金額", "備註"]), use_container_width=True)
-        else:
-            st.info("無適合注單")
-
-    with res_tab2:
-        st.subheader("🧠 模型裁決")
-        total_xg = res["lh"] + res["la"]
-        if total_xg > 3.5: st.warning(f"🟠 高變異節奏 (xG {total_xg:.2f})")
-        elif total_xg > 2.5: st.success(f"🟢 中性節奏 (xG {total_xg:.2f})")
-        else: st.info(f"🔵 低節奏 (xG {total_xg:.2f})")
-        
-        if candidates:
-            top = sorted(candidates, key=lambda x:x["ev"], reverse=True)[0]
-            
-            market_imp = 0.0
-            if top['type'] == '1x2':
-                key_map = {"主勝":"home", "和局":"draw", "客勝":"away"}
-                market_imp = res["true_imp_probs"].get(key_map.get(top['pick']), 0.0)
-            else:
-                market_imp = 1.0/top['odds']
-
-            diff = top['prob'] - market_imp
-            col_c1, col_c2 = st.columns(2)
-            col_c1.metric("模型機率", f"{top['prob']*100:.1f}%")
-            col_c2.metric("市場隱含(去水)", f"{market_imp*100:.1f}%")
-            if diff < 0: st.error("🔴 虛高風險：EV 來自賠率槓桿")
-            elif diff < 0.03: st.warning("🟠 邊際優勢：優勢不明顯")
-            else: st.success("🟢 真實價值：顯著機率偏差")
-
-    with res_tab3:
-        st.subheader("🎯 波膽分佈")
-        disp_g = min(6, engine.max_g)
-        df_cs = pd.DataFrame(M[:disp_g,:disp_g], columns=[f"客{j}" for j in range(disp_g)], index=[f"主{i}" for i in range(disp_g)])
-        st.dataframe(df_cs.style.format("{:.1%}", subset=None))
-
-    with res_tab4:
-        st.subheader("🎲 戰局模擬 (MC Joint-Sampling)")
-        
-        
-        
-        # [V32.0] 使用 Joint-M Sampling
-        sh, sa, sr = engine.run_monte_carlo(res["M"], sims=10000, seed=seed_val)
-        
-        sim_count = len(sr)
-        sc1, sc2, sc3 = st.columns(3)
-        
-        sc1.metric("主勝率", f"{sr.count('home')/sim_count*100:.1f}%")
-        sc2.metric("和局率", f"{sr.count('draw')/sim_count*100:.1f}%")
-        sc3.metric("客勝率", f"{sr.count('away')/sim_count*100:.1f}%")
-        
-        fig, ax = plt.subplots(figsize=(10,4))
-        ch, bh = np.histogram(sh, bins=range(10), density=True)
-        ca, ba = np.histogram(sa, bins=range(10), density=True)
-        ax.bar(bh[:-1]-0.15, ch, width=0.3, color='#1f77b4', alpha=0.7, label='Home')
-        ax.bar(ba[:-1]+0.15, ca, width=0.3, color='#ff7f0e', alpha=0.7, label='Away')
-        ax.legend(); st.pyplot(fig)
-        
         st.divider()
-        st.subheader("⚔️ 戰力雷達")
-        cats = ['Attack', 'Defense', 'Form', 'Home/Away', 'Motivation']
-        def get_s(stats):
-            form_val = sum(stats.get("context_modifiers", {}).get("recent_form_trend", [0,0,0]))
-            form_score = (form_val + 3) * 1.5 
-            xg = stats["offensive_stats"].get("xg_avg", stats["offensive_stats"]["goals_scored_avg"])
-            xga = stats["defensive_stats"].get("xga_avg", stats["defensive_stats"]["goals_conceded_avg"])
-            h_adv = stats["general_strength"].get("home_advantage_weight", 1.0)
-            
-            return [min(10, xg*4), min(10, (3-xga)*3.5), form_score, h_adv*5, 8 if stats["context_modifiers"]["motivation"]!="normal" else 5]
+        st.markdown("### 🏆 V33.0 智能推薦")
+        if candidates:
+            best = sorted(candidates, key=lambda x: x['ev'], reverse=True)[:3]
+            for b in best:
+                amt = unit_stake * (b['kelly']/100)
+                st.markdown(f"""
+                <div class="metric-card">
+                    <b>{b['type']} {b['pick']}</b> <span style='float:right'>賠率 {b['odds']}</span><br>
+                    EV: <span style='color:red'><b>{b['ev']:+.1f}%</b></span> | 建議注碼: <b>{b['kelly']:.1f}%</b> (${amt:.0f})
+                </div>
+                """, unsafe_allow_html=True)
+        else:
+            st.info("🚧 暫無高價值注單 (V33 混合模型過濾了低信心機會)")
+
+    with tab_sim:
+        st.write("基於混合矩陣 (Hybrid Matrix) 的 5,000 次聯合抽樣")
+        h_sim, a_sim, res_sim = engine.run_monte_carlo(M)
         
-        hs, ans = get_s(engine.h), get_s(engine.a)
-        N = len(cats); ang = [n/float(N)*2*math.pi for n in range(N)]; ang+=ang[:1]; hs+=hs[:1]; ans+=ans[:1]
-        figr, axr = plt.subplots(figsize=(6,6), subplot_kw=dict(polar=True))
-        axr.plot(ang, hs, color='#1f77b4', label='Home'); axr.fill(ang, hs, '#1f77b4', alpha=0.2)
-        axr.plot(ang, ans, color='#ff7f0e', label='Away'); axr.fill(ang, ans, '#ff7f0e', alpha=0.2)
-        axr.set_xticks(ang[:-1]); axr.set_xticklabels(cats); axr.legend()
-        st.pyplot(figr)
+        sim_df = pd.DataFrame({"Home": h_sim, "Away": a_sim})
+        
+        c_s1, c_s2 = st.columns(2)
+        with c_s1:
+            st.markdown("**進球分佈 (KDE)**")
+            fig, ax = plt.subplots(figsize=(6, 4))
+            ax.hist(h_sim, bins=range(8), alpha=0.5, label='Home', density=True, color='blue')
+            ax.hist(a_sim, bins=range(8), alpha=0.5, label='Away', density=True, color='orange')
+            ax.legend()
+            st.pyplot(fig)
+        
+        with c_s2:
+            st.markdown("**波膽熱圖 (Top 5)**")
+            cs_counts = sim_df.value_counts().head(5).reset_index()
+            cs_counts.columns = ["主", "客", "次數"]
+            cs_counts["機率"] = (cs_counts["次數"] / 5000).apply(lambda x: f"{x:.1%}")
+            st.dataframe(cs_counts)
