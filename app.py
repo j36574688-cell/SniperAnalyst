@@ -60,7 +60,6 @@ def calc_risk_metrics(prob: float, odds: float) -> Tuple[float, float]:
     sharpe = ev / math.sqrt(var) if var > 0 else 0
     return var, sharpe
 
-# --- [FIXED] 補回缺失的 get_matrix_cached 函數 ---
 @st.cache_data
 def get_matrix_cached(lh: float, la: float, max_g: int, nb_alpha: float, vol_adjust: bool) -> np.ndarray:
     """基礎物理模型矩陣 (V33核心)"""
@@ -213,7 +212,6 @@ class SniperAnalystLogic:
         if use_bivariate and self.lam3 > 0:
             M_model = build_biv_matrix(lh, la, self.lam3, self.max_g)
         else:
-            # 這裡就是之前報錯的地方，現在 get_matrix_cached 已補回
             M_model = get_matrix_cached(lh, la, self.max_g, self.nb_alpha, False) 
 
         true_imp = get_true_implied_prob(self.market["1x2_odds"])
@@ -274,6 +272,13 @@ class SniperAnalystLogic:
             ratio = (lh_s - la_s) / (lh - la) if abs(lh - la) > 0.1 else 1.0
             evs.append(base_ev * ratio)
         return np.percentile(evs, 5), np.percentile(evs, 95)
+
+    def run_monte_carlo(self, M: np.ndarray, sims: int = 10000, seed: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+        rng = np.random.default_rng(seed); G = M.shape[0]; flat_M = M.flatten()
+        indices = rng.choice(G * G, size=sims, p=flat_M/flat_M.sum())
+        sh, sa = indices // G, indices % G
+        res = np.full(sims, "draw", dtype=object); res[sh > sa] = "home"; res[sh < sa] = "away"
+        return sh, sa, res.tolist()
 
 # =========================
 # 5. Streamlit UI (V34 Ultimate)
