@@ -116,7 +116,7 @@ class SniperAnalystLogic:
         self.memory = RegimeMemory()
 
     def calc_lambda(self) -> Tuple[float, float, bool]:
-        """[V33] 加入 Time-Decay 近況加權，並回傳是否加權旗標"""
+        """[V33] 加入 Time-Decay 近況加權"""
         league_base = 1.35
         is_weighted = False
         def att_def_w(team):
@@ -166,7 +166,7 @@ class SniperAnalystLogic:
         }
         return M_hybrid, probs_detail
 
-    # --- 修復點：補回被遺漏的 market_bonus 方法 ---
+    # --- 修復點：補回 get_market_trend_bonus 方法 ---
     def get_market_trend_bonus(self) -> Dict[str, float]:
         bonus = {"home":0.0, "draw":0.0, "away":0.0}
         op, cu = self.market.get("opening_odds"), self.market.get("1x2_odds")
@@ -336,33 +336,37 @@ if app_mode == "🎯 單場深度預測":
                 if adj_ev > 1.0: candidates.append({"pick": tag, "odds": odd, "ev": adj_ev, "kelly": kelly, "type": "1x2", "sharpe": sharpe})
             st.dataframe(pd.DataFrame(r_1x2), use_container_width=True)
             
-            # 2. 亞盤 AH & 大小 OU
+            # 2. 亞盤 AH & 大小 OU (表格已修復)
             c_ah, c_ou = st.columns(2)
             with c_ah:
                 st.subheader("亞盤 (AH)")
                 target_o = engine.market.get("target_odds", 1.90)
+                rows_ah = []
                 for hcap in engine.market["handicaps"]:
                     raw_ev = engine.ah_ev(M, hcap, target_o) + res["market_bonus"]["home"]
                     adj_ev = raw_ev * conf_score * res["penalty"]
                     prob_apx = (raw_ev/100.0 + 1) / target_o
                     var, sharpe = calc_risk_metrics(prob_apx, target_o)
                     kelly = calc_risk_adj_kelly(adj_ev, var, risk_scale, prob_apx)
+                    rows_ah.append({"盤口": f"主 {hcap:+}", "賠率": target_o, "修正EV": f"{adj_ev:+.1f}%", "注碼%": f"{kelly:.1f}%"})
                     if adj_ev > 1.5: candidates.append({"pick": f"主 {hcap:+}", "odds": target_o, "ev": adj_ev, "kelly": kelly, "type": "AH", "sharpe": sharpe})
-                    st.write(f"主 {hcap:+}: **{adj_ev:+.1f}%** EV")
+                st.dataframe(pd.DataFrame(rows_ah), use_container_width=True)
 
             with c_ou:
                 st.subheader("大小 (OU)")
                 idx_sum = np.add.outer(np.arange(engine.max_g), np.arange(engine.max_g))
+                rows_ou = []
                 for line in engine.market["goal_lines"]:
                     p_over = float(M[idx_sum > line].sum())
                     raw_ev = (p_over * target_o - 1) * 100
                     adj_ev = raw_ev * conf_score * res["penalty"]
                     var, sharpe = calc_risk_metrics(p_over, target_o)
                     kelly = calc_risk_adj_kelly(adj_ev, var, risk_scale, p_over)
+                    rows_ou.append({"盤口": f"大 {line}", "賠率": target_o, "修正EV": f"{adj_ev:+.1f}%", "注碼%": f"{kelly:.1f}%"})
                     if adj_ev > 1.5: candidates.append({"pick": f"大 {line}", "odds": target_o, "ev": adj_ev, "kelly": kelly, "type": "OU", "sharpe": sharpe})
-                    st.write(f"大 {line}: **{adj_ev:+.1f}%** EV")
+                st.dataframe(pd.DataFrame(rows_ou), use_container_width=True)
 
-            # --- 🏆 智能投資組合排行榜 (回歸!) ---
+            # --- 🏆 智能投資組合排行榜 ---
             st.divider()
             st.markdown("### 🏆 智能投資組合 (Smart Portfolio)")
             if candidates:
