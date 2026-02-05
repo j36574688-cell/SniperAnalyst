@@ -4,47 +4,40 @@ import math
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import glob
+import os
 from typing import Dict, List, Tuple, Any, Optional
 from functools import lru_cache
 from scipy.special import logsumexp, gammaln
 from scipy.optimize import minimize
 
 # =========================
-# 1. 核心數學工具 (V37.0 Omni-Kernel: Log-Space & Vectorized)
+# 1. 核心數學工具 (V37.0 Omni-Kernel)
 # =========================
 EPS = 1e-15
 
 @lru_cache(maxsize=2048)
 def log_factorial(n: int) -> float:
-    """使用 gammaln 進行快速階乘對數計算"""
     return gammaln(n + 1)
 
 def poisson_logpmf(k: int, lam: float) -> float:
-    """對數空間 Poisson PMF"""
     if lam <= 0: return 0.0 if k == 0 else -np.inf
-    # log(e^-L * L^k / k!) = -L + k*log(L) - log(k!)
     return -lam + k * math.log(lam) - log_factorial(k)
 
 def biv_poisson_logpmf(x: int, y: int, lam1: float, lam2: float, lam3: float) -> float:
-    """[V37] 對數空間雙變量 Poisson (數值絕對穩定)"""
     if lam3 <= 1e-9:
         return poisson_logpmf(x, lam1) + poisson_logpmf(y, lam2)
-    
-    # Formula: log(P) = -sum(L) + logsumexp(terms)
     base = -(lam1 + lam2 + lam3)
     terms = []
     min_k = min(x, y)
-    
     for k in range(min_k + 1):
         try:
-            # term = log(L1^(x-k)) + log(L2^(y-k)) + log(L3^k) - log((x-k)!...)
             t = base
             if x - k > 0: t += (x - k) * math.log(lam1) - log_factorial(x - k)
             if y - k > 0: t += (y - k) * math.log(lam2) - log_factorial(y - k)
             if k > 0: t += k * math.log(lam3) - log_factorial(k)
             terms.append(t)
         except ValueError: continue
-            
     return logsumexp(terms)
 
 def get_true_implied_prob(odds_dict: Dict[str, float]) -> Dict[str, float]:
@@ -69,18 +62,16 @@ def calc_risk_metrics(prob: float, odds: float) -> Tuple[float, float]:
 
 @st.cache_data
 def get_matrix_cached(lh: float, la: float, max_g: int, nb_alpha: float) -> np.ndarray:
-    """Legacy Matrix Builder (Fallback)"""
     G = max_g
     M = np.zeros((G, G))
     for i in range(G):
         for j in range(G):
-            # 使用 exp(log_pmf) 還原機率
             p = math.exp(poisson_logpmf(i, lh) + poisson_logpmf(j, la))
             M[i, j] = p
     return M / M.sum()
 
 # =========================
-# 2. 全景記憶體系 (Standard)
+# 2. 全景記憶體系
 # =========================
 class RegimeMemory:
     def __init__(self):
@@ -121,7 +112,7 @@ class SniperAnalystLogic:
         self.max_g = max_g
         self.nb_alpha = nb_alpha
         self.lam3 = lam3 
-        self.rho = rho # [V37] Dixon-Coles 係數
+        self.rho = rho 
         self.memory = RegimeMemory()
 
     def calc_lambda(self) -> Tuple[float, float, bool]:
@@ -151,40 +142,31 @@ class SniperAnalystLogic:
                (la_att * lh_def / league_base), is_weighted
 
     def build_matrix_v37(self, lh: float, la: float, use_biv: bool = True, use_dc: bool = True) -> Tuple[np.ndarray, Dict]:
-        """[V37] 全能矩陣生成 (Log-Space Bivariate + Dixon-Coles)"""
         G = self.max_g
         M_model = np.zeros((G, G), dtype=float)
         
-        # 1. 物理層 (Log-Space 計算)
         eff_lam3 = max(self.lam3, 0.001) if use_biv else 0.0
-        # 拆解 lambda: E[X] = l1 + l3
         l1 = max(0.01, lh - eff_lam3)
         l2 = max(0.01, la - eff_lam3)
         
         for i in range(G):
             for j in range(G):
-                # 直接計算 exp(log_prob)
                 log_p = biv_poisson_logpmf(i, j, l1, l2, eff_lam3)
                 M_model[i, j] = math.exp(log_p)
 
-        # 2. Dixon-Coles 修正 (針對 0-0, 1-1 等低比分)
         if use_dc:
-            # 定義 tau 函數
             def tau(x, y, mu_h, mu_a, rho):
                 if x==0 and y==0: return 1.0 - (mu_h * mu_a * rho)
                 elif x==0 and y==1: return 1.0 + (mu_h * rho)
                 elif x==1 and y==0: return 1.0 + (mu_a * rho)
                 elif x==1 and y==1: return 1.0 - rho
                 else: return 1.0
-            
-            # 修正左上角
             for i in range(2):
                 for j in range(2):
                     M_model[i, j] *= tau(i, j, lh, la, self.rho)
 
         M_model /= M_model.sum()
 
-        # 3. 市場混合層
         true_imp = get_true_implied_prob(self.market["1x2_odds"])
         p_h = float(np.sum(np.tril(M_model, -1)))
         p_d = float(np.sum(np.diag(M_model)))
@@ -251,90 +233,64 @@ class SniperAnalystLogic:
         return np.percentile(evs, 5), np.percentile(evs, 95)
 
     def run_monte_carlo_vectorized(self, M: np.ndarray, sims: int = 100000) -> Tuple[float, float, float, np.ndarray, np.ndarray]:
-        """[V37] 向量化蒙地卡羅 (速度提升 100 倍)"""
         rng = np.random.default_rng()
         flat_probs = M.flatten()
         flat_probs /= flat_probs.sum()
-        
-        # 建立累積機率分佈 (CDF)
         cdf = np.cumsum(flat_probs)
-        
-        # 一次生成所有亂數並搜尋索引
         draws = rng.random(sims)
         indices = np.searchsorted(cdf, draws)
-        
-        # 還原為主客進球
         G = M.shape[0]
         home_goals = indices // G
         away_goals = indices % G
-        
-        # 向量化判斷
         h_wins = np.sum(home_goals > away_goals) / sims
         draws = np.sum(home_goals == away_goals) / sims
         a_wins = np.sum(home_goals < away_goals) / sims
-        
         return h_wins, draws, a_wins, home_goals, away_goals
 
     def importance_sampling_over(self, M: np.ndarray, line: float, n_sims: int = 20000) -> Dict[str, Any]:
-        """[V37] 向量化重要性採樣"""
         rng = np.random.default_rng()
         G = M.shape[0]; flat = M.flatten()
         idx = np.arange(G*G); i = idx // G; j = idx % G
         sums = (i + j).astype(float)
         bias = (1.0 + sums) ** 1.5 
         q = flat * bias; q /= q.sum()
-        
         draws_idx = rng.choice(G*G, size=n_sims, p=q)
         weights = flat[draws_idx] / q[draws_idx]
-        
-        # 向量化計算
         indicators = (sums[draws_idx] > line)
         est = np.sum(weights * indicators) / np.sum(weights)
         return {"est": float(est)}
 
 # =========================
-# 5. MLE 參數自動擬合 (V37 Calibration Lab)
+# 4. MLE 參數自動擬合
 # =========================
 def fit_params_mle(history_df: pd.DataFrame) -> Dict[str, float]:
-    """使用 scipy.optimize 尋找最佳 lam3 與 rho"""
-    
     def neg_log_likelihood(params):
         lam3, rho = params
         nll = 0.0
-        # 簡單懲罰項防止參數過大
         if not (0 <= lam3 <= 0.5) or not (-0.2 <= rho <= 0.2): return 1e9
-        
         for _, row in history_df.iterrows():
             try:
                 lh, la = float(row['lh_pred']), float(row['la_pred'])
                 h, a = int(row['home_goals']), int(row['away_goals'])
-                
-                # 計算 Log-Prob
                 l1 = max(0.01, lh - lam3)
                 l2 = max(0.01, la - lam3)
                 lp = biv_poisson_logpmf(h, a, l1, l2, lam3)
-                
-                # Dixon-Coles Adjustment in Log Space (approx)
-                # 這裡簡化處理：還原成 prob 乘上 rho factor 再取 log
                 prob = math.exp(lp)
                 if h==0 and a==0: prob *= (1 - lh*la*rho)
                 elif h==0 and a==1: prob *= (1 + lh*rho)
                 elif h==1 and a==0: prob *= (1 + la*rho)
                 elif h==1 and a==1: prob *= (1 - rho)
-                
                 nll -= math.log(max(prob, 1e-9))
             except: continue
         return nll
-
-    # 初始猜測
     initial_guess = [0.1, -0.1]
     result = minimize(neg_log_likelihood, initial_guess, method='Nelder-Mead', tol=1e-3)
     return {"lam3": result.x[0], "rho": result.x[1], "success": result.success}
 
 # =========================
-# 6. Streamlit UI (V37 Omni)
+# 5. Streamlit UI (V37.1 Integrated)
 # =========================
-st.set_page_config(page_title="Sniper V37.0 Omni", page_icon="🧿", layout="wide")
+st.set_page_config(page_title="Sniper V37.1 Omni", page_icon="🧿", layout="wide")
 
 st.markdown("""
 <style>
@@ -344,23 +300,20 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 with st.sidebar:
-    st.title("🧿 Sniper V37.0")
-    st.caption("Omni-Calculator (Log-Space + Vectorized)")
+    st.title("🧿 Sniper V37.1")
+    st.caption("Omni-Calculator")
     st.markdown("---")
-    app_mode = st.radio("功能模式：", ["🎯 單場深度預測", "🔧 參數校正實驗室", "📈 聯賽歷史回測", "📚 劇本查詢"])
+    # [V37.1] 新增「風險對沖實驗室」到選單
+    app_mode = st.radio("功能模式：", ["🎯 單場深度預測", "🛡️ 風險對沖實驗室", "🔧 參數校正實驗室", "📈 聯賽歷史回測", "📚 劇本查詢"])
     st.divider()
-    with st.expander("🛠️ 進階參數 (V37)", expanded=False):
+    with st.expander("🛠️ 進階參數", expanded=False):
         unit_stake = st.number_input("單注本金 ($)", 10, 10000, 100)
         nb_alpha = st.slider("Alpha (NB)", 0.05, 0.25, 0.12)
-        
-        # [V37] 參數控制 (可手動或由實驗室填入)
         use_biv = st.toggle("啟用 Bivariate Poisson", value=True)
         use_dc = st.toggle("啟用 Dixon-Coles", value=True)
-        
         c1, c2 = st.columns(2)
         lam3_input = c1.number_input("Lambda 3", 0.0, 0.5, 0.15, step=0.01)
         rho_input = c2.number_input("Rho (DC)", -0.3, 0.3, -0.13, step=0.01)
-        
         risk_scale = st.slider("風險係數", 0.1, 1.0, 0.3)
         use_mock_memory = st.checkbox("歷史記憶修正", value=True)
         show_uncertainty = st.toggle("顯示 EV 不確定區間", value=True)
@@ -369,7 +322,7 @@ with st.sidebar:
 # 模式 1: 單場深度預測
 # =========================
 if app_mode == "🎯 單場深度預測":
-    st.header("🎯 單場深度預測 (V37 Omni-Engine)")
+    st.header("🎯 單場深度預測 (V37 Engine)")
     if "analysis_results" not in st.session_state: st.session_state.analysis_results = None
 
     tab1, tab2 = st.tabs(["📋 貼上 JSON", "📂 上傳 JSON"])
@@ -385,9 +338,7 @@ if app_mode == "🎯 單場深度預測":
 
     if st.button("🚀 執行高速分析", type="primary"):
         if input_data:
-            # 初始化 V37 引擎 (傳入手動參數)
             engine = SniperAnalystLogic(input_data, 9, nb_alpha, lam3_input, rho_input)
-            
             lh, la, is_weighted = engine.calc_lambda()
             M, probs_detail = engine.build_matrix_v37(lh, la, use_biv=use_biv, use_dc=use_dc)
             market_bonus = engine.get_market_trend_bonus()
@@ -402,12 +353,16 @@ if app_mode == "🎯 單場深度預測":
             diff_p = abs(p_h - m_h) / max(m_h, 1e-9)
             sens_lv, sens_dr = engine.check_sensitivity(lh, la)
             conf_score, conf_reasons = engine.calc_model_confidence(lh, la, diff_p, sens_dr)
+            
+            # 預先計算 MC 供對沖模組使用
+            hw, dr, aw, sh, sa = engine.run_monte_carlo_vectorized(M, sims=100000)
 
             st.session_state.analysis_results = {
                 "engine": engine, "M": M, "lh": lh, "la": la, "is_weighted": is_weighted,
                 "probs_detail": probs_detail, "market_bonus": market_bonus,
                 "history_data": history_data, "penalty": penalty,
-                "conf_score": conf_score, "conf_reasons": conf_reasons
+                "conf_score": conf_score, "conf_reasons": conf_reasons,
+                "sim_data": {"sh": sh, "sa": sa} # 存儲模擬數據供對沖使用
             }
         else:
             st.error("請輸入數據")
@@ -505,9 +460,12 @@ if app_mode == "🎯 單場深度預測":
             st.dataframe(pd.DataFrame(M[:6,:6]).style.format("{:.1%}"))
 
         with t_sim:
-            # [V37] 使用向量化 MC
             st.subheader("高速蒙地卡羅 (100,000 runs)")
-            hw, dr, aw, sh, sa = engine.run_monte_carlo_vectorized(M, sims=100000)
+            # 這裡我們只顯示圖表，數據已在上面計算
+            sh, sa = res["sim_data"]["sh"], res["sim_data"]["sa"]
+            hw = np.sum(sh > sa) / 100000
+            dr = np.sum(sh == sa) / 100000
+            aw = np.sum(sh < sa) / 100000
             
             c1, c2, c3 = st.columns(3)
             c1.metric("主勝率 (MC)", f"{hw:.1%}")
@@ -526,7 +484,109 @@ if app_mode == "🎯 單場深度預測":
             st.metric(f"大 {line_check} 機率", f"{is_res['est']:.2%}")
 
 # =========================
-# 模式 2: 參數校正實驗室 (V37 New)
+# 模式 2: 風險對沖實驗室 (V37.1 New)
+# =========================
+elif app_mode == "🛡️ 風險對沖實驗室":
+    st.title("🛡️ 風險對沖實驗室 (Hedging Lab)")
+    st.markdown("提供 **套利檢測**、**Lay 對沖** 與 **投資組合優化** 工具。")
+    
+    # 檢查是否有分析數據
+    has_data = "analysis_results" in st.session_state and st.session_state.analysis_results is not None
+    
+    tab_arb, tab_lay, tab_port = st.tabs(["⚡ 套利計算機", "📉 Lay 對沖", "📊 組合優化"])
+    
+    # 1. 套利計算機
+    with tab_arb:
+        st.subheader("1x2 套利掃描")
+        c1, c2, c3 = st.columns(3)
+        # 如果有數據，預填入數據
+        def_o = st.session_state.analysis_results["engine"].market["1x2_odds"] if has_data else {"home":2.0, "draw":3.0, "away":4.0}
+        
+        o_h = c1.number_input("主勝賠率", 1.01, 100.0, def_o["home"])
+        o_d = c2.number_input("和局賠率", 1.01, 100.0, def_o["draw"])
+        o_a = c3.number_input("客勝賠率", 1.01, 100.0, def_o["away"])
+        
+        inv_sum = (1/o_h) + (1/o_d) + (1/o_a)
+        arb_ret = (1/inv_sum - 1) * 100
+        
+        if inv_sum < 1.0:
+            st.success(f"🔥 發現套利機會！理論利潤: **{arb_ret:.2f}%**")
+            target_profit = st.number_input("目標總利潤 ($)", 100, 10000, 1000)
+            st.write("建議下注額 (Dutching):")
+            c_s1, c_s2, c_s3 = st.columns(3)
+            c_s1.metric("主勝下注", f"${target_profit/(inv_sum*o_h):.0f}")
+            c_s2.metric("和局下注", f"${target_profit/(inv_sum*o_d):.0f}")
+            c_s3.metric("客勝下注", f"${target_profit/(inv_sum*o_a):.0f}")
+        else:
+            st.info(f"無套利空間 (Book Sum: {inv_sum:.2%})")
+
+    # 2. Lay 對沖
+    with tab_lay:
+        st.subheader("交易所對沖計算器 (Back-Lay)")
+        lc1, lc2 = st.columns(2)
+        back_odds = lc1.number_input("Back 賠率 (Bookie)", 1.01, 100.0, 2.5)
+        back_stake = lc1.number_input("Back 本金 ($)", 10, 10000, 100)
+        lay_odds = lc2.number_input("Lay 賠率 (Exchange)", 1.01, 100.0, 2.4)
+        comm = lc2.number_input("佣金 (%)", 0.0, 10.0, 2.0) / 100.0
+        
+        if lay_odds > 1.0:
+            lay_stake = (back_stake * back_odds) / (lay_odds - comm)
+            liability = lay_stake * (lay_odds - 1)
+            profit = (back_odds - 1)*back_stake - (lay_odds - 1)*lay_stake
+            
+            st.metric("建議 Lay 金額", f"${lay_stake:.2f}")
+            st.write(f"需預留負債: **${liability:.2f}** | 鎖定利潤: **${profit:.2f}**")
+
+    # 3. 組合優化 (需連動)
+    with tab_port:
+        st.subheader("智能組合優化 (Portfolio Optimization)")
+        if has_data:
+            res = st.session_state.analysis_results
+            sh, sa = res["sim_data"]["sh"], res["sim_data"]["sa"]
+            engine = res["engine"]
+            
+            st.info("已載入單場預測的 100,000 次模擬數據。")
+            if st.button("⚡ 計算最佳資金分配 (Markowitz)"):
+                candidates = [
+                    {"name": "主勝", "odds": engine.market["1x2_odds"]["home"], "cond": (sh > sa)},
+                    {"name": "和局", "odds": engine.market["1x2_odds"]["draw"], "cond": (sh == sa)},
+                    {"name": "客勝", "odds": engine.market["1x2_odds"]["away"], "cond": (sh < sa)},
+                    {"name": "大 2.5", "odds": engine.market.get("target_odds", 1.9), "cond": ((sh+sa) > 2.5)},
+                    {"name": "小 2.5", "odds": engine.market.get("target_odds", 1.9), "cond": ((sh+sa) < 2.5)}
+                ]
+                
+                # Payoff Matrix
+                payoffs = np.zeros((100000, len(candidates)))
+                for i, c in enumerate(candidates):
+                    payoffs[:, i] = np.where(c["cond"], c["odds"] - 1, -1)
+                
+                mu = np.mean(payoffs, axis=0)
+                sigma = np.cov(payoffs, rowvar=False)
+                
+                # Optimization
+                n = len(candidates)
+                def objective(w):
+                    ret = np.dot(w, mu)
+                    risk = np.dot(w.T, np.dot(sigma, w))
+                    return -(ret - 0.5 * 2.0 * risk) # Gamma=2.0
+                
+                cons = ({'type': 'eq', 'fun': lambda w: np.sum(w) - 1})
+                bnds = tuple((0, 1) for _ in range(n))
+                init_guess = [1/n] * n
+                
+                try:
+                    res_opt = minimize(objective, init_guess, bounds=bnds, constraints=cons)
+                    st.write("**最佳權重分配 (Risk Aversion = 2.0):**")
+                    cols = st.columns(n)
+                    for i, w in enumerate(res_opt.x):
+                        cols[i].metric(candidates[i]["name"], f"{w:.1%}", delta=f"Exp. Ret: {mu[i]*100:.1f}%")
+                except Exception as e:
+                    st.error(f"優化失敗: {e}")
+        else:
+            st.warning("⚠️ 請先在「單場深度預測」執行分析，以生成模擬數據。")
+
+# =========================
+# 模式 3: 參數校正實驗室
 # =========================
 elif app_mode == "🔧 參數校正實驗室":
     st.header("🔧 參數校正實驗室 (Auto-Calibration)")
@@ -557,12 +617,11 @@ elif app_mode == "🔧 參數校正實驗室":
                 'home_goals': np.random.randint(0, 5, 100),
                 'away_goals': np.random.randint(0, 4, 100)
             })
-            # 這裡簡單轉換為 CSV 下載連結或顯示
             st.dataframe(mock_df)
             st.caption("請將此表格複製並存為 CSV 上傳。")
 
 # =========================
-# 模式 3 & 4
+# 模式 4 & 5
 # =========================
 elif app_mode == "📈 聯賽歷史回測":
     st.title("📈 聯賽歷史回測")
