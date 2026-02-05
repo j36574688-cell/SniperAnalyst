@@ -123,7 +123,7 @@ class SniperAnalystLogic:
         self.memory = RegimeMemory()
 
     def calc_lambda(self) -> Tuple[float, float, bool]:
-        """計算 Lambda"""
+        """計算 Lambda (含近況加權)"""
         league_base = 1.35
         is_weighted = False
         def att_def_w(team):
@@ -150,7 +150,7 @@ class SniperAnalystLogic:
                (la_att * lh_def / league_base), is_weighted
 
     def build_matrix_v37(self, lh: float, la: float, use_biv: bool = True, use_dc: bool = True) -> Tuple[np.ndarray, Dict]:
-        """[V37] 全能矩陣生成"""
+        """[V37] 全能矩陣生成 (Log-Space Bivariate + Dixon-Coles)"""
         G = self.max_g
         M_model = np.zeros((G, G), dtype=float)
         
@@ -306,9 +306,9 @@ def fit_params_mle(history_df: pd.DataFrame) -> Dict[str, float]:
     return {"lam3": result.x[0], "rho": result.x[1], "success": result.success}
 
 # =========================
-# 5. Streamlit UI (V37.7 Multi-Source)
+# 5. Streamlit UI (V37.8 Force Multi)
 # =========================
-st.set_page_config(page_title="Sniper V37.7", page_icon="🧿", layout="wide")
+st.set_page_config(page_title="Sniper V37.8", page_icon="🧿", layout="wide")
 
 st.markdown("""
 <style>
@@ -318,8 +318,8 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 with st.sidebar:
-    st.title("🧿 Sniper V37.7")
-    st.caption("Multi-Source Edition")
+    st.title("🧿 Sniper V37.8")
+    st.caption("Force Multi Edition")
     st.markdown("---")
     app_mode = st.radio("功能模式：", ["🎯 單場深度預測", "🛡️ 風險對沖實驗室", "🔧 參數校正實驗室", "📈 聯賽歷史回測", "📚 劇本查詢"])
     st.divider()
@@ -627,17 +627,18 @@ elif app_mode == "🛡️ 風險對沖實驗室":
             st.warning("⚠️ 請先在「單場深度預測」執行分析，以生成模擬數據。")
 
 # =========================
-# 模式 3: 參數校正實驗室 (V37.7 Multi-Source)
+# 模式 3: 參數校正實驗室 (V37.8 Force Multi)
 # =========================
 elif app_mode == "🔧 參數校正實驗室":
     st.header("🔧 參數校正實驗室 (Auto-Calibration)")
     st.markdown("利用 `scipy.optimize` 尋找歷史數據中的最佳 Lambda3 (共變異) 與 Rho (DC校正)")
     
-    # [V37.7] 允許上傳多個檔案
+    # [V37.8] 強制多選修復：加入 key="uploader_v37_8"
     cal_files = st.file_uploader(
         "上傳含有 lh_pred, la_pred, home_goals, away_goals 的 CSV 或 Excel (可多選)", 
         type=['csv', 'xlsx'], 
-        accept_multiple_files=True
+        accept_multiple_files=True,
+        key="uploader_v37_8" 
     )
     
     if cal_files:
@@ -664,20 +665,23 @@ elif app_mode == "🔧 參數校正實驗室":
                 st.warning(f"檔案 {file.name} 讀取失敗: {e}")
 
         if all_dfs:
-            df_cal = pd.concat(all_dfs, ignore_index=True)
-            st.write(f"成功合併 {len(all_dfs)} 個檔案，共 {len(df_cal)} 筆數據。", df_cal.head())
-            
-            if st.button("⚡ 開始 MLE 擬合", type="primary"):
-                with st.spinner("正在進行最大概似估計 (MLE)..."):
-                    best_params = fit_params_mle(df_cal)
+            try:
+                df_cal = pd.concat(all_dfs, ignore_index=True)
+                st.write(f"成功合併 {len(all_dfs)} 個檔案，共 {len(df_cal)} 筆數據。", df_cal.head())
                 
-                if best_params["success"]:
-                    st.success("校正成功！請將以下參數填入側邊欄：")
-                    c1, c2 = st.columns(2)
-                    c1.metric("最佳 Lambda3", f"{best_params['lam3']:.3f}")
-                    c2.metric("最佳 Rho (DC)", f"{best_params['rho']:.3f}")
-                else:
-                    st.error("校正收斂失敗，請檢查數據品質。")
+                if st.button("⚡ 開始 MLE 擬合", type="primary"):
+                    with st.spinner("正在進行最大概似估計 (MLE)..."):
+                        best_params = fit_params_mle(df_cal)
+                    
+                    if best_params["success"]:
+                        st.success("校正成功！請將以下參數填入側邊欄：")
+                        c1, c2 = st.columns(2)
+                        c1.metric("最佳 Lambda3", f"{best_params['lam3']:.3f}")
+                        c2.metric("最佳 Rho (DC)", f"{best_params['rho']:.3f}")
+                    else:
+                        st.error("校正收斂失敗，請檢查數據品質。")
+            except Exception as e:
+                st.error(f"合併數據時發生錯誤: {e}")
         else:
             st.error("沒有成功讀取任何檔案。")
 
