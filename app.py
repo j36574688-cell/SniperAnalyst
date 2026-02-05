@@ -7,12 +7,18 @@ import matplotlib.pyplot as plt
 import glob
 import os
 import datetime
-import plotly.express as px
-import plotly.graph_objects as go
 from typing import Dict, List, Tuple, Any, Optional
 from functools import lru_cache
 from scipy.special import logsumexp, gammaln
 from scipy.optimize import minimize
+
+# [V39.1] 安全導入 Plotly (防崩潰)
+try:
+    import plotly.express as px
+    import plotly.graph_objects as go
+    HAS_PLOTLY = True
+except ImportError:
+    HAS_PLOTLY = False
 
 # [V38] 嘗試導入 Numba 進行 JIT 加速
 try:
@@ -26,7 +32,7 @@ except ImportError:
     def prange(n): return range(n)
 
 # =========================
-# 1. 核心數學工具 (V38.8 Kernel) - [完整保留]
+# 1. 核心數學工具 (V38.8 Kernel)
 # =========================
 EPS = 1e-15
 
@@ -113,7 +119,7 @@ def get_matrix_cached(lh, la, max_g, nb_alpha):
     return M / M.sum()
 
 # =========================
-# 2. 全景記憶與實戰系統 (V39.0 Paper Trading)
+# 2. 全景記憶與實戰系統
 # =========================
 class RegimeMemory:
     def __init__(self, db_path="regime_db.json"):
@@ -151,7 +157,6 @@ class RegimeMemory:
         if roi > 0.05: return 1.1
         return 1.0
 
-# [V39.0] 模擬交易系統
 class PaperTradingSystem:
     def __init__(self, file_path="my_bets.csv"):
         self.file_path = file_path
@@ -314,7 +319,7 @@ class SniperAnalystLogic:
         return {"est": float(est)}
 
 # =========================
-# 4. 資料與輔助工具
+# 4. 資料處理工具
 # =========================
 def preprocess_uploaded_data(df: pd.DataFrame) -> pd.DataFrame:
     col_map = {
@@ -383,6 +388,7 @@ def run_kalman_tracking(df):
 
 # [V39.0] 視覺化工具
 def plot_score_heatmap(M):
+    if not HAS_PLOTLY: return None
     limit = 6
     labels = [str(i) for i in range(limit)]
     fig = px.imshow(M[:limit, :limit], 
@@ -392,42 +398,38 @@ def plot_score_heatmap(M):
     return fig
 
 def plot_sensitivity_surface(lh_base, la_base, lam3, rho, max_g):
+    if not HAS_PLOTLY: return None
     x = np.linspace(0.8, 1.2, 10)
     y = np.linspace(0.8, 1.2, 10)
     X, Y = np.meshgrid(x, y)
     Z = np.zeros_like(X)
-    
-    # Pre-calculate simplified EVs for home win
     for i in range(10):
         for j in range(10):
             l1, l2 = lh_base * X[i,j], la_base * Y[i,j]
-            # Fast calc prob home
             p = 0
             for h in range(max_g):
-                for a in range(h): # h > a
+                for a in range(h):
                     p += math.exp(biv_poisson_logpmf_fast(h, a, max(0.01, l1-lam3), max(0.01, l2-lam3), lam3))
             Z[i,j] = p
-            
     fig = go.Figure(data=[go.Surface(z=Z, x=X, y=Y)])
     fig.update_layout(title="主勝機率敏感度 (戰力變化)", scene=dict(xaxis_title="主隊係數", yaxis_title="客隊係數", zaxis_title="主勝率"))
     return fig
 
 # =========================
-# 5. UI (V39.0 Omnipotent)
+# 5. UI (V39.1 Robust)
 # =========================
-st.set_page_config(page_title="Sniper V39.0", page_icon="🧿", layout="wide")
+st.set_page_config(page_title="Sniper V39.1", page_icon="🧿", layout="wide")
 st.markdown("<style>.metric-box { background-color: #f0f2f6; padding: 10px; border-radius: 8px; text-align: center; } .stProgress > div > div > div > div { background-color: #4CAF50; }</style>", unsafe_allow_html=True)
 
 with st.sidebar:
-    st.title("🧿 Sniper V39.0")
-    st.caption("Omnipotent Edition")
+    st.title("🧿 Sniper V39.1")
+    st.caption("Robust Edition")
     if HAS_NUMBA: st.success("⚡ Numba 加速：已啟動")
     else: st.warning("⚠️ Numba 加速：未啟動 (請檢查環境)")
     
     app_mode = st.radio("功能模式：", ["🎯 單場深度預測", "🛡️ 風險對沖實驗室", "🔧 參數校正實驗室", "📈 實戰績效回顧", "📚 劇本查詢"])
     st.divider()
     
-    # [V39.0] 賠率轉換器
     with st.expander("💱 賠率轉換器"):
         odd_in = st.number_input("輸入賠率", 1.01)
         fmt = st.selectbox("格式", ["Decimal (歐式)", "American (美式 +150)", "Fractional (2/1)"])
@@ -450,7 +452,6 @@ with st.sidebar:
         use_mock = st.checkbox("歷史記憶修正", True)
         show_unc = st.toggle("顯示區間", True)
 
-# [MODE 1: 單場預測 (Visual Upgrade)]
 if app_mode == "🎯 單場深度預測":
     st.header("🎯 單場深度預測 (V39 視覺引擎)")
     if "analysis_results" not in st.session_state: st.session_state.analysis_results = None
@@ -582,7 +583,6 @@ if app_mode == "🎯 單場深度預測":
                     })
                 st.dataframe(pd.DataFrame(reco), use_container_width=True)
                 
-                # [V39.0] 模擬下注功能
                 bet_pick = st.selectbox("選擇要加入模擬單的注單", [f"[{p['type']}] {p['pick']}" for p in best])
                 if st.button("🛒 加入模擬單 (Paper Trade)"):
                     sel_bet = next(p for p in best if f"[{p['type']}] {p['pick']}" == bet_pick)
@@ -599,16 +599,18 @@ if app_mode == "🎯 單場深度預測":
             
         with t_vis:
             st.subheader("🌈 視覺化洞察")
-            c_v1, c_v2 = st.columns(2)
-            with c_v1:
-                st.plotly_chart(plot_score_heatmap(M), use_container_width=True)
-            with c_v2:
-                # 繪製主勝機率分佈
-                fig_dist = px.histogram(x=res["sh"], nbins=10, labels={'x':'主隊進球'}, title="主隊進球分佈")
-                st.plotly_chart(fig_dist, use_container_width=True)
-            
-            st.divider()
-            st.plotly_chart(plot_sensitivity_surface(res['lh'], res['la'], lam3_in, rho_in, 9), use_container_width=True)
+            if HAS_PLOTLY:
+                c_v1, c_v2 = st.columns(2)
+                with c_v1:
+                    st.plotly_chart(plot_score_heatmap(M), use_container_width=True)
+                with c_v2:
+                    fig_dist = px.histogram(x=res["sh"], nbins=10, labels={'x':'主隊進球'}, title="主隊進球分佈")
+                    st.plotly_chart(fig_dist, use_container_width=True)
+                
+                st.divider()
+                st.plotly_chart(plot_sensitivity_surface(res['lh'], res['la'], lam3_in, rho_in, 9), use_container_width=True)
+            else:
+                st.warning("⚠️ 請安裝 plotly 以啟用視覺化功能")
             
         with t_sim:
             hw = np.sum(res["sh"] > res["sa"]) / 500000
@@ -626,7 +628,6 @@ if app_mode == "🎯 單場深度預測":
             ce_res = eng.run_ce_importance_sampling(M, line_chk)
             st.metric(f"總分大於 {line_chk} 機率", f"{ce_res['est']:.2%}")
             
-            # [V39.0] 匯出報告
             csv = pd.DataFrame(reco).to_csv(index=False).encode('utf-8')
             st.download_button("📥 下載戰術報告 (CSV)", csv, "sniper_report.csv", "text/csv")
 
@@ -670,7 +671,6 @@ elif app_mode == "🛡️ 風險對沖實驗室":
                 opt = minimize(lambda w: -(np.dot(w,mu)-np.dot(w.T,np.dot(sigma,w))), [0.33]*3, bounds=[(0,1)]*3, constraints=cons)
                 for i,w in enumerate(opt.x): st.metric(cands[i]["name"], f"{w:.1%}")
                 
-                # [V38.8] 智能評語
                 ret = np.dot(opt.x, mu)*100
                 st.markdown(f"""<div style='background:#f0f2f6;padding:10px;color:black'>
                 <b>分析師:</b> 預期回報 {ret:.2f}%。建議 {"分散配置" if max(opt.x)<0.7 else "集中單打"}。</div>""", unsafe_allow_html=True)
@@ -708,7 +708,6 @@ elif app_mode == "📈 實戰績效回顧":
     if not df_bets.empty:
         st.dataframe(df_bets)
         
-        # 簡單損益更新 (模擬用，手動輸入結果)
         with st.expander("📝 更新注單結果"):
             idx = st.selectbox("選擇注單", df_bets.index)
             res = st.selectbox("結果", ["Win", "Lose", "Void"])
@@ -721,8 +720,7 @@ elif app_mode == "📈 實戰績效回顧":
                 df_bets.to_csv("my_bets.csv", index=False)
                 st.rerun()
         
-        # 繪製資金曲線
-        if "PnL" in df_bets.columns:
+        if "PnL" in df_bets.columns and HAS_PLOTLY:
             df_bets["CumPnL"] = df_bets["PnL"].cumsum()
             fig = px.line(df_bets, x="Date", y="CumPnL", title="模擬資金成長曲線", markers=True)
             st.plotly_chart(fig)
