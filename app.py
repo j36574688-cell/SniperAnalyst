@@ -23,7 +23,7 @@ except ImportError:
     def prange(n): return range(n)
 
 # =========================
-# 1. 核心數學工具 (V38.6 Kernel)
+# 1. 核心數學工具 (V38.7 Kernel)
 # =========================
 EPS = 1e-15
 
@@ -178,7 +178,6 @@ class SniperAnalystLogic:
         strength_gap = (lh_att - la_att)
         crush_factor = 1.05 if strength_gap > 0.5 else 1.0
         
-        # Apply Home Adv
         lh = (lh_att * la_def / 1.35) * self.home_adv * crush_factor
         la = (la_att * lh_def / 1.35)
         
@@ -365,14 +364,14 @@ def run_kalman_tracking(df):
     return pd.DataFrame(hist), ratings
 
 # =========================
-# 5. UI (V38.6 TC & Expanded)
+# 5. UI (V38.6 Full House + TC)
 # =========================
 st.set_page_config(page_title="Sniper V38.6", page_icon="🧿", layout="wide")
 st.markdown("<style>.metric-box { background-color: #f0f2f6; padding: 10px; border-radius: 8px; text-align: center; } .stProgress > div > div > div > div { background-color: #4CAF50; }</style>", unsafe_allow_html=True)
 
 with st.sidebar:
     st.title("🧿 Sniper V38.6")
-    st.caption("Traditional Chinese & Expanded")
+    st.caption("Traditional Chinese Edition")
     if HAS_NUMBA: st.success("⚡ Numba 加速：已啟動")
     else: st.warning("⚠️ Numba 加速：未啟動 (請檢查環境)")
     
@@ -391,7 +390,7 @@ with st.sidebar:
         use_mock = st.checkbox("歷史記憶修正", True)
         show_unc = st.toggle("顯示區間", True)
 
-# [MODE 1: 單場預測 (TC & Expanded)]
+# [MODE 1: 單場預測 (Full Restoration + TC)]
 if app_mode == "🎯 單場深度預測":
     st.header("🎯 單場深度預測 (V38 引擎)")
     if "analysis_results" not in st.session_state: st.session_state.analysis_results = None
@@ -449,7 +448,6 @@ if app_mode == "🎯 單場深度預測":
         
         candidates = []
         
-        # [Tab 1: Value Betting - Expanded Tables]
         with t_val:
             st.subheader("獨贏 (1x2)")
             r_1x2 = []
@@ -473,7 +471,7 @@ if app_mode == "🎯 單場深度預測":
                     "真實機率": f"{p:.1%}",
                     "期望值 (EV)": ev_str, 
                     "凱利建議": f"{kelly:.1f}%",
-                    "金額": f"${stake_amt:.0f}"
+                    "建議金額": f"${stake_amt:.0f}"
                 })
                 if adj_ev > 1.0: 
                     candidates.append({"pick": tag, "odds": o, "ev": adj_ev, "kelly": kelly, "type": "1x2"})
@@ -498,7 +496,7 @@ if app_mode == "🎯 單場深度預測":
                         "過盤機率": f"{p_approx:.1%}",
                         "期望值": f"{adj:+.1f}%", 
                         "凱利": f"{kel:.1f}%",
-                        "金額": f"${stake_amt:.0f}"
+                        "建議金額": f"${stake_amt:.0f}"
                     })
                     if adj > 1.5: candidates.append({"pick":f"AH {hcap:+}", "odds":target, "ev":adj, "kelly":kel, "type":"AH"})
                 st.dataframe(pd.DataFrame(rows_ah), use_container_width=True)
@@ -521,9 +519,9 @@ if app_mode == "🎯 單場深度預測":
                         "過盤機率": f"{p_over:.1%}",
                         "期望值": f"{adj:+.1f}%", 
                         "凱利": f"{kel:.1f}%",
-                        "金額": f"${stake_amt:.0f}"
+                        "建議金額": f"${stake_amt:.0f}"
                     })
-                    if adj > 1.5: candidates.append({"pick":f"大 {line}", "odds":target, "ev":adj, "kelly":kel, "type":"OU"})
+                    if adj > 1.5: candidates.append({"pick":f"Over {line}", "odds":target, "ev":adj, "kelly":kel, "type":"OU"})
                 st.dataframe(pd.DataFrame(rows_ou), use_container_width=True)
                 
             st.divider()
@@ -566,39 +564,89 @@ if app_mode == "🎯 單場深度預測":
             ce_res = eng.run_ce_importance_sampling(M, line_chk)
             st.metric(f"總分大於 {line_chk} 機率", f"{ce_res['est']:.2%}")
 
-# [MODE 2: 風險對沖]
+# [MODE 2: 風險對沖 (Full Restoration)]
 elif app_mode == "🛡️ 風險對沖實驗室":
     st.title("🛡️ 風險對沖實驗室")
-    if st.session_state.get("analysis_results"):
-        res = st.session_state.analysis_results
-        sh, sa = res["sh"], res["sa"]
-        eng = res["eng"]
+    
+    tab_arb, tab_lay, tab_port = st.tabs(["⚡ 1x2 套利掃描", "📉 交易所對沖", "📊 智能組合優化"])
+    
+    # 1. 套利
+    with tab_arb:
+        st.subheader("無風險套利計算 (Arbitrage)")
+        c1, c2, c3 = st.columns(3)
+        # 預設賠率如果 session 有就抓，沒有就給預設值
+        def_o = {"home":2.0, "draw":3.0, "away":4.0}
+        if st.session_state.get("analysis_results"):
+            def_o = st.session_state.analysis_results["eng"].market["1x2_odds"]
+            
+        o_h = c1.number_input("主勝賠率", 1.01, 100.0, def_o["home"])
+        o_d = c2.number_input("和局賠率", 1.01, 100.0, def_o["draw"])
+        o_a = c3.number_input("客勝賠率", 1.01, 100.0, def_o["away"])
         
-        if st.button("⚡ 計算最佳投資組合"):
-            cands = [
-                {"name": "主勝", "odds": eng.market["1x2_odds"]["home"], "cond": (sh > sa)},
-                {"name": "和局", "odds": eng.market["1x2_odds"]["draw"], "cond": (sh == sa)},
-                {"name": "大2.5", "odds": eng.market.get("target_odds", 1.9), "cond": ((sh+sa) > 2.5)}
-            ]
-            payoffs = np.zeros((500000, len(cands)))
-            for i, c in enumerate(cands): payoffs[:, i] = np.where(c["cond"], c["odds"]-1, -1)
-            mu = payoffs.mean(axis=0)
-            sigma = np.cov(payoffs, rowvar=False)
+        inv_sum = (1/o_h) + (1/o_d) + (1/o_a)
+        arb_ret = (1/inv_sum - 1) * 100
+        
+        if inv_sum < 1.0:
+            st.success(f"🔥 發現套利機會！理論利潤: **{arb_ret:.2f}%**")
+            target_profit = st.number_input("目標總利潤 ($)", 100, 10000, 1000)
+            st.write("建議下注額 (Dutching):")
+            c_s1, c_s2, c_s3 = st.columns(3)
+            c_s1.metric("主勝下注", f"${target_profit/(inv_sum*o_h):.0f}")
+            c_s2.metric("和局下注", f"${target_profit/(inv_sum*o_d):.0f}")
+            c_s3.metric("客勝下注", f"${target_profit/(inv_sum*o_a):.0f}")
+        else:
+            st.info(f"無套利空間 (Book Sum: {inv_sum:.2%})")
+
+    # 2. Lay 對沖
+    with tab_lay:
+        st.subheader("交易所對沖計算器 (Back-Lay)")
+        lc1, lc2 = st.columns(2)
+        back_odds = lc1.number_input("Back 賠率 (Bookie)", 1.01, 100.0, 2.5)
+        back_stake = lc1.number_input("Back 本金 ($)", 10, 10000, 100)
+        lay_odds = lc2.number_input("Lay 賠率 (Exchange)", 1.01, 100.0, 2.4)
+        comm = lc2.number_input("佣金 (%)", 0.0, 10.0, 2.0) / 100.0
+        
+        if lay_odds > 1.0:
+            lay_stake = (back_stake * back_odds) / (lay_odds - comm)
+            liability = lay_stake * (lay_odds - 1)
+            profit = (back_odds - 1)*back_stake - (lay_odds - 1)*lay_stake
             
-            def obj(w): return -(np.dot(w, mu) - 2.0 * np.dot(w.T, np.dot(sigma, w)))
-            cons = ({'type': 'eq', 'fun': lambda w: np.sum(w)-1})
-            opt = minimize(obj, [1/len(cands)]*len(cands), bounds=[(0,1)]*len(cands), constraints=cons)
+            st.metric("建議 Lay 金額", f"${lay_stake:.2f}")
+            st.write(f"需預留負債: **${liability:.2f}** | 鎖定利潤: **${profit:.2f}**")
+
+    # 3. 組合優化
+    with tab_port:
+        st.subheader("智能組合優化 (Portfolio Optimization)")
+        if st.session_state.get("analysis_results"):
+            res = st.session_state.analysis_results
+            sh, sa = res["sh"], res["sa"]
+            eng = res["eng"]
             
-            cols = st.columns(len(cands))
-            for i, w in enumerate(opt.x):
-                cols[i].metric(cands[i]["name"], f"{w:.1%}", delta=f"EV: {mu[i]*100:.1f}%")
-            
-            st.markdown("""<div style="background:#f0f2f6; padding:10px; color:#333333; border-radius:5px;">
-            <h4 style="margin:0; color:blue;">👨‍🏫 首席分析師評語</h4>
-            <p style="color:#333333 !important;">請依照上述比例分配資金以最大化風險回報比 (Sharpe Ratio)。</p>
-            </div>""", unsafe_allow_html=True)
-    else:
-        st.warning("請先執行「單場深度預測」以獲取模擬數據")
+            if st.button("⚡ 計算最佳投資組合"):
+                cands = [
+                    {"name": "主勝", "odds": eng.market["1x2_odds"]["home"], "cond": (sh > sa)},
+                    {"name": "和局", "odds": eng.market["1x2_odds"]["draw"], "cond": (sh == sa)},
+                    {"name": "大2.5", "odds": eng.market.get("target_odds", 1.9), "cond": ((sh+sa) > 2.5)}
+                ]
+                payoffs = np.zeros((500000, len(cands)))
+                for i, c in enumerate(cands): payoffs[:, i] = np.where(c["cond"], c["odds"]-1, -1)
+                mu = payoffs.mean(axis=0)
+                sigma = np.cov(payoffs, rowvar=False)
+                
+                def obj(w): return -(np.dot(w, mu) - 2.0 * np.dot(w.T, np.dot(sigma, w)))
+                cons = ({'type': 'eq', 'fun': lambda w: np.sum(w)-1})
+                opt = minimize(obj, [1/len(cands)]*len(cands), bounds=[(0,1)]*len(cands), constraints=cons)
+                
+                cols = st.columns(len(cands))
+                for i, w in enumerate(opt.x):
+                    cols[i].metric(cands[i]["name"], f"{w:.1%}", delta=f"EV: {mu[i]*100:.1f}%")
+                
+                st.markdown("""<div style="background:#f0f2f6; padding:10px; color:#333333; border-radius:5px;">
+                <h4 style="margin:0; color:blue;">👨‍🏫 首席分析師評語</h4>
+                <p style="color:#333333 !important;">請依照上述比例分配資金以最大化風險回報比 (Sharpe Ratio)。此配置已考慮了各選項之間的相關性與對沖效果。</p>
+                </div>""", unsafe_allow_html=True)
+        else:
+            st.warning("⚠️ 請先執行「單場深度預測」以獲取模擬數據")
 
 # [MODE 3: 參數校正]
 elif app_mode == "🔧 參數校正實驗室":
@@ -629,7 +677,7 @@ elif app_mode == "🔧 參數校正實驗室":
                     with st.spinner("計算中..."):
                         r = fit_params_mle(full_df)
                     if r["success"]:
-                        st.success(f"建議參數: Lam3={r['lam3']:.2f}, Rho={r['rho']:.2f}, HA={r['home_adv']:.2f}")
+                        st.success(f"建議參數: Lam3={r['lam3']:.3f}, Rho={r['rho']:.3f}, HA={r['home_adv']:.3f}")
                     else: st.error("收斂失敗")
             with c2:
                 if st.button("📈 Kalman 動態追蹤"):
