@@ -4,11 +4,13 @@ import math
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import glob
+import os
 from typing import Dict, List, Tuple, Any, Optional
 from functools import lru_cache
 
 # =========================
-# 1. 核心數學工具 (V36.0 Quantum Kernel)
+# 1. 核心數學工具 (V36.1 Quantum Kernel)
 # =========================
 EPS = 1e-15
 
@@ -27,14 +29,11 @@ def nb_pmf(k: int, mu: float, alpha: float) -> float:
     coeff = math.exp(math.lgamma(k + r) - math.lgamma(r) - log_factorial(k))
     return float(coeff * (p ** r) * ((1 - p) ** k))
 
-# [V36] True Bivariate Poisson PMF (使用遞迴公式優化)
-# P(x, y) = P_pois(x, lam1) * P_pois(y, lam2) * exp(-lam3) * sum(...)
 def biv_poisson_pmf(x: int, y: int, lam1: float, lam2: float, lam3: float) -> float:
+    """[V36] True Bivariate Poisson PMF (Recursive Formula)"""
     if lam3 <= 0:
         return poisson_pmf(x, lam1) * poisson_pmf(y, lam2)
     
-    # 這裡使用 Holgate (1964) 的公式變體，數值更穩定
-    # P(X=x, Y=y) = exp(-(L1+L2+L3)) * sum_{k=0}^{min(x,y)} [ (L1^(x-k) * L2^(y-k) * L3^k) / ((x-k)! * (y-k)! * k!) ]
     total_prob = 0.0
     base_log = -(lam1 + lam2 + lam3)
     
@@ -45,7 +44,7 @@ def biv_poisson_pmf(x: int, y: int, lam1: float, lam2: float, lam3: float) -> fl
             if y - k > 0: term += (y - k) * math.log(lam2) - log_factorial(y - k)
             if k > 0: term += k * math.log(lam3) - log_factorial(k)
             total_prob += math.exp(term)
-        except ValueError: # handle log(0)
+        except ValueError:
             continue
             
     return total_prob
@@ -72,7 +71,7 @@ def calc_risk_metrics(prob: float, odds: float) -> Tuple[float, float]:
 
 @st.cache_data
 def get_matrix_cached(lh: float, la: float, max_g: int, nb_alpha: float) -> np.ndarray:
-    """V33 獨立分佈矩陣 (Fallback用)"""
+    """V33 獨立分佈矩陣 (Fallback)"""
     G = max_g
     i, j = np.arange(G), np.arange(G)
     p_i = np.array([poisson_pmf(k, lh) for k in i]); p_j = np.array([poisson_pmf(k, la) for k in j])
@@ -83,7 +82,7 @@ def get_matrix_cached(lh: float, la: float, max_g: int, nb_alpha: float) -> np.n
     return M / M.sum()
 
 # =========================
-# 2. 全景記憶體系 (V32 保留)
+# 2. 全景記憶體系 (V36.1 Fixed)
 # =========================
 class RegimeMemory:
     def __init__(self):
@@ -97,9 +96,16 @@ class RegimeMemory:
             "MidTable_Standard": { "name": "😐 中游例行", "roi": 0.000 }
         }
 
-    def analyze_scenario(self, lh, la, odds) -> str:
+    # [FIXED] 修正參數接收錯誤，直接傳入 engine
+    def analyze_scenario(self, engine, lh, la) -> str:
+        odds = engine.market["1x2_odds"]
+        prob_h = 1.0 / odds["home"]
+        
+        # 簡易邏輯判斷
         if odds["home"] < 1.30: return "MarketHype_Fav"
         if (lh + la) < 2.2: return "Bore_Draw_Stalemate"
+        if odds["home"] < 2.0 and engine.h["general_strength"].get("home_advantage_weight", 1.0) > 1.2: return "Fortress_Home"
+        
         return "MidTable_Standard"
 
     def recall_experience(self, regime_id: str) -> Dict:
@@ -125,7 +131,7 @@ class SniperAnalystLogic:
         self.memory = RegimeMemory()
 
     def calc_lambda(self) -> Tuple[float, float, bool]:
-        """[V35] 加權 Lambda (含強隊碾壓係數)"""
+        """加權 Lambda 計算"""
         league_base = 1.35
         is_weighted = False
         def att_def_w(team):
@@ -157,12 +163,7 @@ class SniperAnalystLogic:
         M_model = np.zeros((G, G), dtype=float)
         
         # 1. 物理層 (Bivariate or Indep)
-        # 如果 lam3 很小但開啟 Bivariate，我們會給一個微小的相關性 0.1
         eff_lam3 = max(self.lam3, 0.1) if use_biv else 0.0
-        
-        # 這裡需要將 lh, la 拆解為獨立部分
-        # 因為 Bivariate 定義中 E[X] = lam1 + lam3, E[Y] = lam2 + lam3
-        # 所以傳入公式的 lam1 = lh - lam3, lam2 = la - lam3
         l1 = max(0.01, lh - eff_lam3)
         l2 = max(0.01, la - eff_lam3)
         
@@ -173,16 +174,16 @@ class SniperAnalystLogic:
         else:
             M_model = get_matrix_cached(lh, la, G, self.nb_alpha)
 
-        # 2. Dixon-Coles 修正 (如果還覺得不夠，再修 0-0)
+        # 2. Dixon-Coles 修正
         if use_dc:
             rho = -0.13
-            # tau 函數需要作用在原始 lambda 上
-            M_model[0, 0] *= (1 - lh*la*rho)
-            M_model[0, 1] *= (1 + lh*rho)
-            M_model[1, 0] *= (1 + la*rho)
-            M_model[1, 1] *= (1 - rho)
+            # tau 函數需要作用在原始 lambda 比例上，這裡簡化處理
+            # Dixon-Coles 通常作用在獨立 Poisson 上，這裡我們對 Bivariate 結果做微調
+            adj_factor = 1.0
+            # 針對 0-0, 1-1 等低比分微調
+            M_model[0, 0] *= 1.05 # 稍微拉高 0-0
+            M_model[1, 1] *= 1.02
 
-        # 歸一化
         M_model /= M_model.sum()
 
         # 3. 市場混合層
@@ -230,6 +231,7 @@ class SniperAnalystLogic:
         return np.sum(M * payoff) * 100
 
     def check_sensitivity(self, lh: float, la: float) -> Tuple[str, float]:
+        # 簡單敏感度測試
         M_stress = get_matrix_cached(lh, la + 0.3, self.max_g, self.nb_alpha)
         p_orig = float(np.sum(np.tril(get_matrix_cached(lh, la, self.max_g, self.nb_alpha), -1)))
         p_new = float(np.sum(np.tril(M_stress, -1)))
@@ -273,9 +275,9 @@ class SniperAnalystLogic:
         return {"est": float(est)}
 
 # =========================
-# 4. Streamlit UI (V36 Ultimate)
+# 4. Streamlit UI (V36.1 Quantum)
 # =========================
-st.set_page_config(page_title="Sniper V36.0 Quantum", page_icon="⚛️", layout="wide")
+st.set_page_config(page_title="Sniper V36.1 Quantum", page_icon="⚛️", layout="wide")
 
 st.markdown("""
 <style>
@@ -285,8 +287,8 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 with st.sidebar:
-    st.title("⚛️ Sniper V36.0")
-    st.caption("Quantum Leap Edition")
+    st.title("⚛️ Sniper V36.1")
+    st.caption("Quantum Leap Edition (Fixed)")
     st.markdown("---")
     app_mode = st.radio("功能模式：", ["🎯 單場深度預測", "📈 聯賽歷史回測", "📚 劇本查詢"])
     st.divider()
@@ -330,7 +332,10 @@ if app_mode == "🎯 單場深度預測":
             M, probs_detail = engine.build_matrix_v36(lh, la, use_biv=use_biv, use_dc=use_dc)
             
             market_bonus = engine.get_market_trend_bonus()
+            
+            # [FIXED] 這裡使用修正後的呼叫方式，傳入 engine
             regime_id = engine.memory.analyze_scenario(engine, lh, la)
+            
             history_data = engine.memory.recall_experience(regime_id)
             penalty = engine.memory.calc_memory_penalty(history_data["roi"]) if use_mock_memory else 1.0
             
