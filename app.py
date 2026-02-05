@@ -78,7 +78,7 @@ def get_matrix_cached(lh: float, la: float, max_g: int, nb_alpha: float) -> np.n
     return M / M.sum()
 
 # =========================
-# 2. 全景記憶體系 (Fixed)
+# 2. 全景記憶體系
 # =========================
 class RegimeMemory:
     def __init__(self):
@@ -108,7 +108,7 @@ class RegimeMemory:
         return 1.0
 
 # =========================
-# 3. 分析引擎邏輯 (V37.0 Omni-Engine)
+# 3. 分析引擎邏輯
 # =========================
 class SniperAnalystLogic:
     def __init__(self, json_data: Any, max_g: int = 9, nb_alpha: float = 0.12, lam3: float = 0.0, rho: float = -0.13):
@@ -123,7 +123,7 @@ class SniperAnalystLogic:
         self.memory = RegimeMemory()
 
     def calc_lambda(self) -> Tuple[float, float, bool]:
-        """計算 Lambda (含近況加權)"""
+        """計算 Lambda"""
         league_base = 1.35
         is_weighted = False
         def att_def_w(team):
@@ -150,11 +150,10 @@ class SniperAnalystLogic:
                (la_att * lh_def / league_base), is_weighted
 
     def build_matrix_v37(self, lh: float, la: float, use_biv: bool = True, use_dc: bool = True) -> Tuple[np.ndarray, Dict]:
-        """[V37] 全能矩陣生成 (Log-Space Bivariate + Dixon-Coles)"""
+        """[V37] 全能矩陣生成"""
         G = self.max_g
         M_model = np.zeros((G, G), dtype=float)
         
-        # 1. 物理層 (Log-Space 計算)
         eff_lam3 = max(self.lam3, 0.001) if use_biv else 0.0
         l1 = max(0.01, lh - eff_lam3)
         l2 = max(0.01, la - eff_lam3)
@@ -164,7 +163,6 @@ class SniperAnalystLogic:
                 log_p = biv_poisson_logpmf(i, j, l1, l2, eff_lam3)
                 M_model[i, j] = math.exp(log_p)
 
-        # 2. Dixon-Coles 修正
         if use_dc:
             def tau(x, y, mu_h, mu_a, rho):
                 if x==0 and y==0: return 1.0 - (mu_h * mu_a * rho)
@@ -179,7 +177,6 @@ class SniperAnalystLogic:
 
         M_model /= M_model.sum()
 
-        # 3. 市場混合層
         true_imp = get_true_implied_prob(self.market["1x2_odds"])
         p_h = float(np.sum(np.tril(M_model, -1)))
         p_d = float(np.sum(np.diag(M_model)))
@@ -309,9 +306,9 @@ def fit_params_mle(history_df: pd.DataFrame) -> Dict[str, float]:
     return {"lam3": result.x[0], "rho": result.x[1], "success": result.success}
 
 # =========================
-# 5. Streamlit UI (V37.3 Black Ink)
+# 5. Streamlit UI (V37.4 Obsidian - Forced Black Text)
 # =========================
-st.set_page_config(page_title="Sniper V37.3", page_icon="🧿", layout="wide")
+st.set_page_config(page_title="Sniper V37.4", page_icon="🧿", layout="wide")
 
 st.markdown("""
 <style>
@@ -321,8 +318,8 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 with st.sidebar:
-    st.title("🧿 Sniper V37.3")
-    st.caption("Black Ink Edition")
+    st.title("🧿 Sniper V37.4")
+    st.caption("Obsidian Edition")
     st.markdown("---")
     app_mode = st.radio("功能模式：", ["🎯 單場深度預測", "🛡️ 風險對沖實驗室", "🔧 參數校正實驗室", "📈 聯賽歷史回測", "📚 劇本查詢"])
     st.divider()
@@ -338,9 +335,6 @@ with st.sidebar:
         use_mock_memory = st.checkbox("歷史記憶修正", value=True)
         show_uncertainty = st.toggle("顯示 EV 不確定區間", value=True)
 
-# =========================
-# 模式 1: 單場深度預測
-# =========================
 if app_mode == "🎯 單場深度預測":
     st.header("🎯 單場深度預測 (V37 Engine)")
     if "analysis_results" not in st.session_state: st.session_state.analysis_results = None
@@ -374,7 +368,6 @@ if app_mode == "🎯 單場深度預測":
             sens_lv, sens_dr = engine.check_sensitivity(lh, la)
             conf_score, conf_reasons = engine.calc_model_confidence(lh, la, diff_p, sens_dr)
             
-            # 預先計算 MC
             hw, dr, aw, sh, sa = engine.run_monte_carlo_vectorized(M, sims=100000)
 
             st.session_state.analysis_results = {
@@ -485,26 +478,20 @@ if app_mode == "🎯 單場深度預測":
             hw = np.sum(sh > sa) / 100000
             dr = np.sum(sh == sa) / 100000
             aw = np.sum(sh < sa) / 100000
-            
             c1, c2, c3 = st.columns(3)
             c1.metric("主勝率 (MC)", f"{hw:.1%}")
             c2.metric("和局率 (MC)", f"{dr:.1%}")
             c3.metric("客勝率 (MC)", f"{aw:.1%}")
-            
             fig, ax = plt.subplots(figsize=(6,3))
             ax.hist(sh, alpha=0.5, label="Home", bins=range(8), density=True)
             ax.hist(sa, alpha=0.5, label="Away", bins=range(8), density=True)
             ax.legend(); st.pyplot(fig)
-            
             st.divider()
             st.subheader("稀有事件 (Importance Sampling)")
             line_check = 4.5
             is_res = engine.importance_sampling_over(M, line_check)
             st.metric(f"大 {line_check} 機率", f"{is_res['est']:.2%}")
 
-# =========================
-# 模式 2: 風險對沖實驗室 (連動 + 智能評語 + 黑字修正)
-# =========================
 elif app_mode == "🛡️ 風險對沖實驗室":
     st.title("🛡️ 風險對沖實驗室 (Hedging Lab)")
     st.markdown("提供 **套利檢測**、**Lay 對沖** 與 **投資組合優化** 工具。")
@@ -552,16 +539,14 @@ elif app_mode == "🛡️ 風險對沖實驗室":
             st.metric("建議 Lay 金額", f"${lay_stake:.2f}")
             st.write(f"需預留負債: **${liability:.2f}** | 鎖定利潤: **${profit:.2f}**")
 
-    # 3. 組合優化 (智能評語 + 黑色字體)
+    # 3. 組合優化 (強制黑字版)
     with tab_port:
         st.subheader("智能組合優化 (Portfolio Optimization)")
         if has_data:
             res = st.session_state.analysis_results
             sh, sa = res["sim_data"]["sh"], res["sim_data"]["sa"]
             engine = res["engine"]
-            
             st.info("已載入單場預測的 100,000 次模擬數據。")
-            
             candidates = [
                 {"name": "主勝", "odds": engine.market["1x2_odds"]["home"], "cond": (sh > sa)},
                 {"name": "和局", "odds": engine.market["1x2_odds"]["draw"], "cond": (sh == sa)},
@@ -569,29 +554,23 @@ elif app_mode == "🛡️ 風險對沖實驗室":
                 {"name": "大 2.5", "odds": engine.market.get("target_odds", 1.9), "cond": ((sh+sa) > 2.5)},
                 {"name": "小 2.5", "odds": engine.market.get("target_odds", 1.9), "cond": ((sh+sa) < 2.5)}
             ]
-
             if st.button("⚡ 計算最佳資金分配 (Markowitz)"):
                 payoffs = np.zeros((100000, len(candidates)))
                 for i, c in enumerate(candidates):
                     payoffs[:, i] = np.where(c["cond"], c["odds"] - 1, -1)
-                
                 mu = np.mean(payoffs, axis=0)
                 sigma = np.cov(payoffs, rowvar=False)
-                
                 n = len(candidates)
                 def objective(w):
                     ret = np.dot(w, mu)
                     risk = np.dot(w.T, np.dot(sigma, w))
-                    return -(ret - 0.5 * 2.0 * risk) # Gamma=2.0
-                
+                    return -(ret - 0.5 * 2.0 * risk)
                 cons = ({'type': 'eq', 'fun': lambda w: np.sum(w) - 1})
                 bnds = tuple((0, 1) for _ in range(n))
                 init_guess = [1/n] * n
-                
                 try:
                     res_opt = minimize(objective, init_guess, bounds=bnds, constraints=cons)
                     weights = res_opt.x
-                    
                     st.write("**最佳權重分配 (Risk Aversion = 2.0):**")
                     cols = st.columns(n)
                     active_bets = []
@@ -602,7 +581,7 @@ elif app_mode == "🛡️ 風險對沖實驗室":
                         else:
                             cols[i].metric(candidates[i]["name"], "0.0%", delta_color="off")
                     
-                    # --- 👨‍🏫 首席分析師總結 (黑字修正版) ---
+                    # --- 👨‍🏫 首席分析師總結 (強制黑字) ---
                     st.divider()
                     st.markdown("### 👨‍🏫 首席分析師評語 (Verdict)")
                     
@@ -618,30 +597,27 @@ elif app_mode == "🛡️ 風險對沖實驗室":
                         verdict_color = "red"
                         verdict_title = "⛔ 風險過高 / 無價值"
                         verdict_text = "Sniper 模型經運算後認為，此場比賽**無任何注單具備足夠的風險回報比**。即使分散投資，期望值依然過低。建議**直接跳過此場**，保留資金。"
-                    
                     elif max_w > 0.7:
                         verdict_color = "green"
                         verdict_title = "🔥 強力單注出擊"
                         verdict_text = f"模型對 **【{top_pick}】** 展現出極高的信心 (權重 > 70%)。這表示模擬結果顯示該選項與其他選項的關聯風險極低。建議**集中資金單打**此選項，無需過度對沖。"
-                    
                     elif len(active_bets) >= 2:
                         verdict_color = "orange"
                         verdict_title = "⚖️ 結構化對沖組合"
                         picks_str = " + ".join([f"{p[0]}" for p in active_bets])
                         verdict_text = f"模型建議採取 **「組合拳」** 策略。主要由 **【{picks_str}】** 構成。這代表這些選項在數學上具有**互補性** (例如：主勝通常伴隨大分)。請務必**依照建議比例分注**，才能有效降低單邊倒的風險。"
-                    
                     else:
                         verdict_color = "blue"
                         verdict_title = "🔵 一般價值投資"
                         verdict_text = f"發現些微價值，主要集中在 {top_pick}，但優勢並非壓倒性。建議小注怡情。"
 
-                    # CSS 修正：加入 color: #000000;
+                    # 使用 !important 強制覆蓋深色模式的白字
                     st.markdown(f"""
-                    <div style="padding: 15px; border-radius: 5px; border-left: 5px solid {verdict_color}; background-color: #f0f2f6; color: #000000;">
-                        <h4 style="margin:0; color:{verdict_color};">{verdict_title}</h4>
-                        <p style="margin-top:10px; font-size:16px;">{verdict_text}</p>
-                        <hr>
-                        <small>📊 組合預期回報率 (Portfolio EV): <b>{total_exp_return:.2f}%</b></small>
+                    <div style="padding: 15px; border-radius: 5px; border-left: 5px solid {verdict_color}; background-color: #f0f2f6; color: #333333;">
+                        <h4 style="margin:0; color:{verdict_color}; font-weight: bold;">{verdict_title}</h4>
+                        <p style="margin-top:10px; font-size:16px; color: #333333 !important; font-weight: 500;">{verdict_text}</p>
+                        <hr style="border-color: #cccccc;">
+                        <small style="color: #555555 !important;">📊 組合預期回報率 (Portfolio EV): <b style="color: #333333;">{total_exp_return:.2f}%</b></small>
                     </div>
                     """, unsafe_allow_html=True)
 
@@ -650,22 +626,16 @@ elif app_mode == "🛡️ 風險對沖實驗室":
         else:
             st.warning("⚠️ 請先在「單場深度預測」執行分析，以生成模擬數據。")
 
-# =========================
-# 模式 3: 參數校正實驗室
-# =========================
 elif app_mode == "🔧 參數校正實驗室":
     st.header("🔧 參數校正實驗室 (Auto-Calibration)")
     st.markdown("利用 `scipy.optimize` 尋找歷史數據中的最佳 Lambda3 (共變異) 與 Rho (DC校正)")
-    
     cal_file = st.file_uploader("上傳含有 lh_pred, la_pred, home_goals, away_goals 的 CSV", type=['csv'])
-    
     if cal_file:
         df_cal = pd.read_csv(cal_file)
         st.write("預覽數據:", df_cal.head())
         if st.button("⚡ 開始 MLE 擬合", type="primary"):
             with st.spinner("正在進行最大概似估計 (MLE)..."):
                 best_params = fit_params_mle(df_cal)
-                
             if best_params["success"]:
                 st.success("校正成功！請將以下參數填入側邊欄：")
                 c1, c2 = st.columns(2)
@@ -685,9 +655,6 @@ elif app_mode == "🔧 參數校正實驗室":
             st.dataframe(mock_df)
             st.caption("請將此表格複製並存為 CSV 上傳。")
 
-# =========================
-# 模式 4 & 5
-# =========================
 elif app_mode == "📈 聯賽歷史回測":
     st.title("📈 聯賽歷史回測")
     st.info("請將 CSV 檔案放入資料夾後，使用 V37 Batch Engine 進行測試。")
