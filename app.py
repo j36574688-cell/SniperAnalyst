@@ -23,7 +23,7 @@ except ImportError:
     def prange(n): return range(n)
 
 # =========================
-# 1. 核心數學工具 (V38.5 Kernel)
+# 1. 核心數學工具 (V38.6 Kernel)
 # =========================
 EPS = 1e-15
 
@@ -102,12 +102,10 @@ def calc_risk_metrics(prob, odds):
 
 @st.cache_data
 def get_matrix_cached(lh, la, max_g, nb_alpha):
-    # Fallback for sensitivity check
     G = max_g
     M = np.zeros((G, G))
     for i in range(G):
         for j in range(G):
-            # Simple Poisson for stress test
             p = math.exp(biv_poisson_logpmf_fast(i, j, lh, la, 0.0))
             M[i, j] = p
     return M / M.sum()
@@ -152,7 +150,7 @@ class RegimeMemory:
         return 1.0
 
 # =========================
-# 3. 分析引擎邏輯 (V38.5 Restored Full Logic)
+# 3. 分析引擎邏輯
 # =========================
 class SniperAnalystLogic:
     def __init__(self, json_data, max_g=9, nb_alpha=0.12, lam3=0.0, rho=-0.13, home_adv=1.15):
@@ -166,7 +164,6 @@ class SniperAnalystLogic:
         self.memory = RegimeMemory()
 
     def calc_lambda(self):
-        # [Restored Logic]
         def att_def_w(team):
             xg, xga = team["offensive_stats"].get("xg_avg", 1.0), team["defensive_stats"].get("xga_avg", 1.0)
             trend = team["context_modifiers"].get("recent_form_trend", [0, 0, 0])
@@ -185,8 +182,7 @@ class SniperAnalystLogic:
         lh = (lh_att * la_def / 1.35) * self.home_adv * crush_factor
         la = (la_att * lh_def / 1.35)
         
-        if self.h["context_modifiers"].get("missing_key_defender"): lh *= 0.9 # logic changed? assume def affects other team score
-        # Previous logic: if home missing defender, AWAY score increases (la increases)
+        if self.h["context_modifiers"].get("missing_key_defender"): lh *= 0.9 
         if self.h["context_modifiers"].get("missing_key_defender"): la *= 1.25
         if self.a["context_modifiers"].get("missing_key_defender"): lh *= 1.20
         
@@ -232,7 +228,6 @@ class SniperAnalystLogic:
         return M_hybrid, {"model": {"home": ph, "draw": pd, "away": pa}, "market": imp, "hybrid": {"home": th, "draw": td, "away": ta}}
 
     def get_market_trend_bonus(self):
-        # [Restored]
         bonus = {"home":0.0, "draw":0.0, "away":0.0}
         op, cu = self.market.get("opening_odds"), self.market.get("1x2_odds")
         if not op or not cu: return bonus
@@ -242,7 +237,6 @@ class SniperAnalystLogic:
         return bonus
 
     def ah_ev(self, M, hcap, odds):
-        # [Restored Recursive Logic for 0.25/0.75]
         q = int(round(hcap * 4))
         if q % 2 != 0: return 0.5 * self.ah_ev(M, (q+1)/4.0, odds) + 0.5 * self.ah_ev(M, (q-1)/4.0, odds)
         
@@ -251,7 +245,6 @@ class SniperAnalystLogic:
         return np.sum(M * payoff) * 100
 
     def check_sensitivity(self, lh, la):
-        # [Restored]
         M_stress = get_matrix_cached(lh, la + 0.3, self.max_g, self.nb_alpha)
         p_orig = float(np.sum(np.tril(get_matrix_cached(lh, la, self.max_g, self.nb_alpha), -1)))
         p_new = float(np.sum(np.tril(M_stress, -1)))
@@ -259,7 +252,6 @@ class SniperAnalystLogic:
         return ("High" if drop > 0.15 else "Medium"), drop
 
     def calc_model_confidence(self, lh, la, diff, sens):
-        # [Restored]
         score, reasons = 1.0, []
         if diff > 0.25: score *= 0.7; reasons.append(f"與市場差異過大 ({diff:.1%})")
         if sens > 0.15: score *= 0.8; reasons.append("模型對運氣球敏感")
@@ -285,22 +277,16 @@ class SniperAnalystLogic:
 
     def run_ce_importance_sampling(self, M, line, n_sims=20000):
         G = M.shape[0]
-        # Calculate means
         i_idx, j_idx = np.indices((G,G))
         mu_h = np.sum(M * i_idx)
         mu_a = np.sum(M * j_idx)
-        
-        # Biased params
         v_h, v_a = mu_h * 1.5, mu_a * 1.5
         rng = np.random.default_rng()
         sh = rng.poisson(v_h, n_sims)
         sa = rng.poisson(v_a, n_sims)
-        
-        # Likelihood Ratio
         log_w = (sh*(np.log(mu_h)-np.log(v_h)) - (mu_h-v_h)) + \
                 (sa*(np.log(mu_a)-np.log(v_a)) - (mu_a-v_a))
         w = np.exp(log_w)
-        
         est = np.sum(w * ((sh+sa)>line)) / n_sims
         return {"est": float(est)}
 
@@ -332,7 +318,6 @@ def preprocess_uploaded_data(df: pd.DataFrame) -> pd.DataFrame:
         st.info("ℹ️ 自動生成預期進球 (Based on League Avg)...")
         avg_h, avg_a = df['home_goals'].mean(), df['away_goals'].mean()
         df['lh_pred'] = avg_h; df['la_pred'] = avg_a
-        # Try simple rolling mean
         try:
             h_roll = df.groupby('home')['home_goals'].transform(lambda x: x.shift().expanding().mean())
             a_roll = df.groupby('away')['away_goals'].transform(lambda x: x.shift().expanding().mean())
@@ -380,49 +365,49 @@ def run_kalman_tracking(df):
     return pd.DataFrame(hist), ratings
 
 # =========================
-# 5. UI (V38.5 Restoration)
+# 5. UI (V38.6 TC & Expanded)
 # =========================
-st.set_page_config(page_title="Sniper V38.5", page_icon="🧿", layout="wide")
+st.set_page_config(page_title="Sniper V38.6", page_icon="🧿", layout="wide")
 st.markdown("<style>.metric-box { background-color: #f0f2f6; padding: 10px; border-radius: 8px; text-align: center; } .stProgress > div > div > div > div { background-color: #4CAF50; }</style>", unsafe_allow_html=True)
 
 with st.sidebar:
-    st.title("🧿 Sniper V38.5")
-    st.caption("Restored Edition")
-    if HAS_NUMBA: st.success("⚡ Numba 加速：ON")
-    else: st.warning("⚠️ Numba 加速：OFF")
+    st.title("🧿 Sniper V38.6")
+    st.caption("Traditional Chinese & Expanded")
+    if HAS_NUMBA: st.success("⚡ Numba 加速：已啟動")
+    else: st.warning("⚠️ Numba 加速：未啟動 (請檢查環境)")
     
     app_mode = st.radio("功能模式：", ["🎯 單場深度預測", "🛡️ 風險對沖實驗室", "🔧 參數校正實驗室", "📈 聯賽歷史回測", "📚 劇本查詢"])
     st.divider()
-    with st.expander("🛠️ 進階參數", expanded=False):
-        unit_stake = st.number_input("單注 ($)", 10, 10000, 100)
-        nb_alpha = st.slider("Alpha", 0.05, 0.25, 0.12)
-        use_biv = st.toggle("Biv Poisson", True)
-        use_dc = st.toggle("Dixon-Coles", True)
+    with st.expander("🛠️ 進階參數設定", expanded=False):
+        unit_stake = st.number_input("單注本金 ($)", 10, 10000, 100)
+        nb_alpha = st.slider("Alpha (NB)", 0.05, 0.25, 0.12)
+        use_biv = st.toggle("雙變量 Poisson", True)
+        use_dc = st.toggle("Dixon-Coles 修正", True)
         st.markdown("---")
-        lam3_in = st.number_input("Lambda 3", 0.0, 0.5, 0.15, step=0.01)
-        rho_in = st.number_input("Rho", -0.3, 0.3, -0.13, step=0.01)
-        ha_in = st.number_input("Home Adv", 0.8, 1.6, 1.15, step=0.01)
-        risk_scale = st.slider("風險係數", 0.1, 1.0, 0.3)
+        lam3_in = st.number_input("Lambda 3 (相關性)", 0.0, 0.5, 0.15, step=0.01)
+        rho_in = st.number_input("Rho (DC修正)", -0.3, 0.3, -0.13, step=0.01)
+        ha_in = st.number_input("主場優勢 (Home Adv)", 0.8, 1.6, 1.15, step=0.01)
+        risk_scale = st.slider("Kelly 風險係數", 0.1, 1.0, 0.3)
         use_mock = st.checkbox("歷史記憶修正", True)
         show_unc = st.toggle("顯示區間", True)
 
-# [MODE 1: 單場預測 (Full Restoration)]
+# [MODE 1: 單場預測 (TC & Expanded)]
 if app_mode == "🎯 單場深度預測":
-    st.header("🎯 單場深度預測 (V38 Engine)")
+    st.header("🎯 單場深度預測 (V38 引擎)")
     if "analysis_results" not in st.session_state: st.session_state.analysis_results = None
     
     t1, t2 = st.tabs(["📋 貼上 JSON", "📂 上傳 JSON"])
     inp = None
     with t1:
-        txt = st.text_area("JSON Input", height=100)
+        txt = st.text_area("在此貼上 JSON", height=100)
         if txt: 
             try: inp = json.loads(txt)
-            except: st.error("Format Error")
+            except: st.error("JSON 格式錯誤")
     with t2:
-        f = st.file_uploader("JSON File", type=['json'])
+        f = st.file_uploader("上傳 JSON 檔案", type=['json'])
         if f: inp = json.load(f)
 
-    if st.button("🚀 執行分析", type="primary") and inp:
+    if st.button("🚀 開始戰術分析", type="primary") and inp:
         eng = SniperAnalystLogic(inp, 9, nb_alpha, lam3_in, rho_in, ha_in)
         lh, la, w = eng.calc_lambda()
         M, probs = eng.build_matrix_v38(lh, la, use_biv, use_dc)
@@ -449,22 +434,22 @@ if app_mode == "🎯 單場深度預測":
         res = st.session_state.analysis_results
         eng, M, probs = res["eng"], res["M"], res["probs"]
         
-        st.markdown("### 🔍 V38 戰術儀表板")
+        st.markdown("### 🔍 戰術儀表板")
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("主預期", f"{res['lh']:.2f}", delta="加權" if res["w"] else None)
-        c2.metric("客預期", f"{res['la']:.2f}")
-        c3.metric("混合主勝", f"{probs['hybrid']['home']:.1%}")
-        c4.metric("信心", f"{res['conf']:.0%}")
+        c1.metric("主隊進球期望", f"{res['lh']:.2f}", delta="加權" if res["w"] else None)
+        c2.metric("客隊進球期望", f"{res['la']:.2f}")
+        c3.metric("模型主勝率", f"{probs['hybrid']['home']:.1%}")
+        c4.metric("信心指數", f"{res['conf']:.0%}")
         
         if res["conf"] < 1.0:
-            with st.expander("⚠️ 扣分原因"):
+            with st.expander("⚠️ 信心扣分原因"):
                 for r in res["reasons"]: st.warning(r)
 
         t_val, t_ai, t_score, t_sim = st.tabs(["💰 價值投資", "🧠 智能裁決", "🎯 波膽分佈", "🎲 極速模擬"])
         
         candidates = []
         
-        # [Tab 1: Value Betting - Detailed Tables]
+        # [Tab 1: Value Betting - Expanded Tables]
         with t_val:
             st.subheader("獨贏 (1x2)")
             r_1x2 = []
@@ -475,13 +460,21 @@ if app_mode == "🎯 單場深度預測":
                 adj_ev = raw_ev * res["conf"] * res["pen"]
                 var, sharpe = calc_risk_metrics(p, o)
                 kelly = calc_risk_adj_kelly(adj_ev, var, risk_scale, p)
+                stake_amt = unit_stake * (kelly/100.0)
                 
                 ev_str = f"{adj_ev:+.1f}%"
                 if show_unc:
                     l, h = eng.simulate_uncertainty(res['lh'], res['la'], adj_ev)
                     ev_str += f" [{l:.1f}, {h:.1f}]"
                 
-                r_1x2.append({"Pick": tag, "Odds": o, "EV": ev_str, "Kelly": f"{kelly:.1f}%"})
+                r_1x2.append({
+                    "選項": tag, 
+                    "賠率": o, 
+                    "真實機率": f"{p:.1%}",
+                    "期望值 (EV)": ev_str, 
+                    "凱利建議": f"{kelly:.1f}%",
+                    "金額": f"${stake_amt:.0f}"
+                })
                 if adj_ev > 1.0: 
                     candidates.append({"pick": tag, "odds": o, "ev": adj_ev, "kelly": kelly, "type": "1x2"})
             st.dataframe(pd.DataFrame(r_1x2), use_container_width=True)
@@ -497,7 +490,16 @@ if app_mode == "🎯 單場深度預測":
                     p_approx = (raw/100+1)/target
                     var, _ = calc_risk_metrics(p_approx, target)
                     kel = calc_risk_adj_kelly(adj, var, risk_scale, p_approx)
-                    rows_ah.append({"盤口": f"{hcap:+}", "EV": f"{adj:+.1f}%", "Kelly": f"{kel:.1f}%"})
+                    stake_amt = unit_stake * (kel/100.0)
+                    
+                    rows_ah.append({
+                        "盤口": f"{hcap:+}", 
+                        "賠率": target,
+                        "過盤機率": f"{p_approx:.1%}",
+                        "期望值": f"{adj:+.1f}%", 
+                        "凱利": f"{kel:.1f}%",
+                        "金額": f"${stake_amt:.0f}"
+                    })
                     if adj > 1.5: candidates.append({"pick":f"AH {hcap:+}", "odds":target, "ev":adj, "kelly":kel, "type":"AH"})
                 st.dataframe(pd.DataFrame(rows_ah), use_container_width=True)
                 
@@ -511,52 +513,68 @@ if app_mode == "🎯 單場深度預測":
                     adj = raw * res["conf"] * res["pen"]
                     var, _ = calc_risk_metrics(p_over, target)
                     kel = calc_risk_adj_kelly(adj, var, risk_scale, p_over)
-                    rows_ou.append({"盤口": f"Over {line}", "EV": f"{adj:+.1f}%", "Kelly": f"{kel:.1f}%"})
-                    if adj > 1.5: candidates.append({"pick":f"Over {line}", "odds":target, "ev":adj, "kelly":kel, "type":"OU"})
+                    stake_amt = unit_stake * (kel/100.0)
+                    
+                    rows_ou.append({
+                        "盤口": f"大 {line}", 
+                        "賠率": target,
+                        "過盤機率": f"{p_over:.1%}",
+                        "期望值": f"{adj:+.1f}%", 
+                        "凱利": f"{kel:.1f}%",
+                        "金額": f"${stake_amt:.0f}"
+                    })
+                    if adj > 1.5: candidates.append({"pick":f"大 {line}", "odds":target, "ev":adj, "kelly":kel, "type":"OU"})
                 st.dataframe(pd.DataFrame(rows_ou), use_container_width=True)
                 
             st.divider()
-            st.markdown("### 🏆 智能投資組合")
+            st.markdown("### 🏆 智能投資組合建議")
             if candidates:
                 best = sorted(candidates, key=lambda x: x['ev'], reverse=True)[:3]
                 reco = []
                 for p in best:
                     amt = unit_stake * (p['kelly']/100)
                     reco.append([f"[{p['type']}] {p['pick']}", p['odds'], f"{p['ev']:+.1f}%", f"{p['kelly']:.1f}%", f"${amt:.1f}"])
-                st.dataframe(pd.DataFrame(reco, columns=["選項","賠率","EV","注碼%","金額"]), use_container_width=True)
+                st.dataframe(pd.DataFrame(reco, columns=["策略選項","賠率","預期回報(EV)","權重%","建議金額($)"]), use_container_width=True)
             else:
-                st.info("🚧 風險過高，建議觀望")
+                st.info("🚧 本場風險過高，建議觀望")
 
         with t_ai:
             st.write("V38 混合權重分析")
-            df_c = pd.DataFrame([probs["model"], probs["market"], probs["hybrid"]], index=["Model","Market","Hybrid"])
+            df_c = pd.DataFrame([probs["model"], probs["market"], probs["hybrid"]], index=["純模型","市場隱含","混合權重"])
             st.dataframe(df_c.style.format("{:.1%}"))
             
         with t_score:
-            st.write("波膽矩陣")
+            st.write("波膽分佈矩陣")
             st.dataframe(pd.DataFrame(M[:6,:6]).style.format("{:.1%}"))
             
         with t_sim:
             hw = np.sum(res["sh"] > res["sa"]) / 500000
-            st.metric("MC 主勝率", f"{hw:.1%}")
+            dr = np.sum(res["sh"] == res["sa"]) / 500000
+            aw = np.sum(res["sh"] < res["sa"]) / 500000
+            
+            c1, c2, c3 = st.columns(3)
+            c1.metric("MC 主勝", f"{hw:.1%}")
+            c2.metric("MC 和局", f"{dr:.1%}")
+            c3.metric("MC 客勝", f"{aw:.1%}")
+            
             fig, ax = plt.subplots(figsize=(6,2))
-            ax.hist(res["sh"], alpha=0.5, label="H"); ax.hist(res["sa"], alpha=0.5, label="A"); ax.legend()
+            ax.hist(res["sh"], alpha=0.5, label="主隊"); ax.hist(res["sa"], alpha=0.5, label="客隊"); ax.legend()
             st.pyplot(fig)
             st.divider()
-            st.subheader("稀有事件 (CE-IS)")
+            st.subheader("稀有事件機率 (CE-IS)")
             line_chk = 4.5
             ce_res = eng.run_ce_importance_sampling(M, line_chk)
-            st.metric(f"大 {line_chk} 機率", f"{ce_res['est']:.2%}")
+            st.metric(f"總分大於 {line_chk} 機率", f"{ce_res['est']:.2%}")
 
-# [MODE 2: 風險對沖 (Black Text Fix)]
+# [MODE 2: 風險對沖]
 elif app_mode == "🛡️ 風險對沖實驗室":
-    st.title("🛡️ 風險對沖")
+    st.title("🛡️ 風險對沖實驗室")
     if st.session_state.get("analysis_results"):
         res = st.session_state.analysis_results
         sh, sa = res["sh"], res["sa"]
         eng = res["eng"]
         
-        if st.button("⚡ 計算組合優化"):
+        if st.button("⚡ 計算最佳投資組合"):
             cands = [
                 {"name": "主勝", "odds": eng.market["1x2_odds"]["home"], "cond": (sh > sa)},
                 {"name": "和局", "odds": eng.market["1x2_odds"]["draw"], "cond": (sh == sa)},
@@ -580,12 +598,12 @@ elif app_mode == "🛡️ 風險對沖實驗室":
             <p style="color:#333333 !important;">請依照上述比例分配資金以最大化風險回報比 (Sharpe Ratio)。</p>
             </div>""", unsafe_allow_html=True)
     else:
-        st.warning("請先執行單場預測")
+        st.warning("請先執行「單場深度預測」以獲取模擬數據")
 
-# [MODE 3: 參數校正 (Multi-File)]
+# [MODE 3: 參數校正]
 elif app_mode == "🔧 參數校正實驗室":
     st.header("🔧 參數校正 (自動適配)")
-    files = st.file_uploader("上傳 CSV/Excel (可多選)", type=['csv','xlsx'], accept_multiple_files=True, key="up_v38_5")
+    files = st.file_uploader("上傳 CSV/Excel (可多選)", type=['csv','xlsx'], accept_multiple_files=True, key="up_v38_6")
     
     if files:
         dfs = []
@@ -607,14 +625,14 @@ elif app_mode == "🔧 參數校正實驗室":
             
             c1, c2 = st.columns(2)
             with c1:
-                if st.button("⚡ MLE 擬合"):
+                if st.button("⚡ MLE 參數擬合"):
                     with st.spinner("計算中..."):
                         r = fit_params_mle(full_df)
                     if r["success"]:
-                        st.success(f"建議參數: Lam3={r['lam3']:.3f}, Rho={r['rho']:.3f}, HA={r['home_adv']:.3f}")
+                        st.success(f"建議參數: Lam3={r['lam3']:.2f}, Rho={r['rho']:.2f}, HA={r['home_adv']:.2f}")
                     else: st.error("收斂失敗")
             with c2:
-                if st.button("📈 Kalman 追蹤"):
+                if st.button("📈 Kalman 動態追蹤"):
                     h, r = run_kalman_tracking(full_df)
                     st.dataframe(h.tail())
 
