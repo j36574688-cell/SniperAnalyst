@@ -18,23 +18,18 @@ EPS = 1e-15
 
 @lru_cache(maxsize=2048)
 def log_factorial(n: int) -> float:
-    """使用 gammaln 進行快速階乘對數計算"""
     return gammaln(n + 1)
 
 def poisson_logpmf(k: int, lam: float) -> float:
-    """對數空間 Poisson PMF"""
     if lam <= 0: return 0.0 if k == 0 else -np.inf
     return -lam + k * math.log(lam) - log_factorial(k)
 
 def biv_poisson_logpmf(x: int, y: int, lam1: float, lam2: float, lam3: float) -> float:
-    """[V37] 對數空間雙變量 Poisson (數值絕對穩定)"""
     if lam3 <= 1e-9:
         return poisson_logpmf(x, lam1) + poisson_logpmf(y, lam2)
-    
     base = -(lam1 + lam2 + lam3)
     terms = []
     min_k = min(x, y)
-    
     for k in range(min_k + 1):
         try:
             t = base
@@ -43,7 +38,6 @@ def biv_poisson_logpmf(x: int, y: int, lam1: float, lam2: float, lam3: float) ->
             if k > 0: t += k * math.log(lam3) - log_factorial(k)
             terms.append(t)
         except ValueError: continue
-            
     return logsumexp(terms)
 
 def get_true_implied_prob(odds_dict: Dict[str, float]) -> Dict[str, float]:
@@ -68,7 +62,6 @@ def calc_risk_metrics(prob: float, odds: float) -> Tuple[float, float]:
 
 @st.cache_data
 def get_matrix_cached(lh: float, la: float, max_g: int, nb_alpha: float) -> np.ndarray:
-    """Legacy Matrix Builder (Fallback)"""
     G = max_g
     M = np.zeros((G, G))
     for i in range(G):
@@ -78,7 +71,7 @@ def get_matrix_cached(lh: float, la: float, max_g: int, nb_alpha: float) -> np.n
     return M / M.sum()
 
 # =========================
-# 2. 全景記憶體系 (Fixed)
+# 2. 全景記憶體系
 # =========================
 class RegimeMemory:
     def __init__(self):
@@ -108,7 +101,7 @@ class RegimeMemory:
         return 1.0
 
 # =========================
-# 3. 分析引擎邏輯 (V37.0 Omni-Engine)
+# 3. 分析引擎邏輯
 # =========================
 class SniperAnalystLogic:
     def __init__(self, json_data: Any, max_g: int = 9, nb_alpha: float = 0.12, lam3: float = 0.0, rho: float = -0.13):
@@ -123,7 +116,6 @@ class SniperAnalystLogic:
         self.memory = RegimeMemory()
 
     def calc_lambda(self) -> Tuple[float, float, bool]:
-        """計算 Lambda (含近況加權)"""
         league_base = 1.35
         is_weighted = False
         def att_def_w(team):
@@ -150,11 +142,9 @@ class SniperAnalystLogic:
                (la_att * lh_def / league_base), is_weighted
 
     def build_matrix_v37(self, lh: float, la: float, use_biv: bool = True, use_dc: bool = True) -> Tuple[np.ndarray, Dict]:
-        """[V37] 全能矩陣生成 (Log-Space Bivariate + Dixon-Coles)"""
         G = self.max_g
         M_model = np.zeros((G, G), dtype=float)
         
-        # 1. 物理層 (Log-Space 計算)
         eff_lam3 = max(self.lam3, 0.001) if use_biv else 0.0
         l1 = max(0.01, lh - eff_lam3)
         l2 = max(0.01, la - eff_lam3)
@@ -164,7 +154,6 @@ class SniperAnalystLogic:
                 log_p = biv_poisson_logpmf(i, j, l1, l2, eff_lam3)
                 M_model[i, j] = math.exp(log_p)
 
-        # 2. Dixon-Coles 修正
         if use_dc:
             def tau(x, y, mu_h, mu_a, rho):
                 if x==0 and y==0: return 1.0 - (mu_h * mu_a * rho)
@@ -179,7 +168,6 @@ class SniperAnalystLogic:
 
         M_model /= M_model.sum()
 
-        # 3. 市場混合層
         true_imp = get_true_implied_prob(self.market["1x2_odds"])
         p_h = float(np.sum(np.tril(M_model, -1)))
         p_d = float(np.sum(np.diag(M_model)))
@@ -246,37 +234,29 @@ class SniperAnalystLogic:
         return np.percentile(evs, 5), np.percentile(evs, 95)
 
     def run_monte_carlo_vectorized(self, M: np.ndarray, sims: int = 100000) -> Tuple[float, float, float, np.ndarray, np.ndarray]:
-        """[V37] 向量化蒙地卡羅"""
         rng = np.random.default_rng()
         flat_probs = M.flatten()
         flat_probs /= flat_probs.sum()
-        
         cdf = np.cumsum(flat_probs)
         draws = rng.random(sims)
         indices = np.searchsorted(cdf, draws)
-        
         G = M.shape[0]
         home_goals = indices // G
         away_goals = indices % G
-        
         h_wins = np.sum(home_goals > away_goals) / sims
         draws = np.sum(home_goals == away_goals) / sims
         a_wins = np.sum(home_goals < away_goals) / sims
-        
         return h_wins, draws, a_wins, home_goals, away_goals
 
     def importance_sampling_over(self, M: np.ndarray, line: float, n_sims: int = 20000) -> Dict[str, Any]:
-        """[V37] 向量化重要性採樣"""
         rng = np.random.default_rng()
         G = M.shape[0]; flat = M.flatten()
         idx = np.arange(G*G); i = idx // G; j = idx % G
         sums = (i + j).astype(float)
         bias = (1.0 + sums) ** 1.5 
         q = flat * bias; q /= q.sum()
-        
         draws_idx = rng.choice(G*G, size=n_sims, p=q)
         weights = flat[draws_idx] / q[draws_idx]
-        
         indicators = (sums[draws_idx] > line)
         est = np.sum(weights * indicators) / np.sum(weights)
         return {"est": float(est)}
@@ -309,9 +289,9 @@ def fit_params_mle(history_df: pd.DataFrame) -> Dict[str, float]:
     return {"lam3": result.x[0], "rho": result.x[1], "success": result.success}
 
 # =========================
-# 5. Streamlit UI (V37.5 Universal Reader)
+# 5. Streamlit UI (V37.6 Universal)
 # =========================
-st.set_page_config(page_title="Sniper V37.5", page_icon="🧿", layout="wide")
+st.set_page_config(page_title="Sniper V37.6", page_icon="🧿", layout="wide")
 
 st.markdown("""
 <style>
@@ -321,7 +301,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 with st.sidebar:
-    st.title("🧿 Sniper V37.5")
+    st.title("🧿 Sniper V37.6")
     st.caption("Universal Reader Edition")
     st.markdown("---")
     app_mode = st.radio("功能模式：", ["🎯 單場深度預測", "🛡️ 風險對沖實驗室", "🔧 參數校正實驗室", "📈 聯賽歷史回測", "📚 劇本查詢"])
@@ -630,40 +610,48 @@ elif app_mode == "🛡️ 風險對沖實驗室":
             st.warning("⚠️ 請先在「單場深度預測」執行分析，以生成模擬數據。")
 
 # =========================
-# 模式 3: 參數校正實驗室
+# 模式 3: 參數校正實驗室 (V37.6 Fixed)
 # =========================
 elif app_mode == "🔧 參數校正實驗室":
     st.header("🔧 參數校正實驗室 (Auto-Calibration)")
     st.markdown("利用 `scipy.optimize` 尋找歷史數據中的最佳 Lambda3 (共變異) 與 Rho (DC校正)")
     
-    cal_file = st.file_uploader("上傳含有 lh_pred, la_pred, home_goals, away_goals 的 CSV 或 Excel", type=['csv', 'xlsx'])
+    cal_file = st.file_uploader("上傳 CSV 或 Excel (支援 .csv, .xlsx)", type=['csv', 'xlsx'])
     
     if cal_file:
+        df_cal = None
+        # V37.6 萬用讀取邏輯
         try:
-            if cal_file.name.endswith('.csv'):
+            filename = cal_file.name.lower()
+            if filename.endswith('.csv'):
                 try:
                     df_cal = pd.read_csv(cal_file, encoding='utf-8')
                 except UnicodeDecodeError:
                     cal_file.seek(0)
                     df_cal = pd.read_csv(cal_file, encoding='big5')
-            else:
-                df_cal = pd.read_excel(cal_file)
+            elif filename.endswith(('.xls', '.xlsx')):
+                try:
+                    import openpyxl
+                    df_cal = pd.read_excel(cal_file, engine='openpyxl')
+                except ImportError:
+                    st.error("❌ 環境缺少 `openpyxl` 套件，無法讀取 Excel。請檢查 requirements.txt。")
             
-            st.write("預覽數據:", df_cal.head())
-            if st.button("⚡ 開始 MLE 擬合", type="primary"):
-                with st.spinner("正在進行最大概似估計 (MLE)..."):
-                    best_params = fit_params_mle(df_cal)
-                
-                if best_params["success"]:
-                    st.success("校正成功！請將以下參數填入側邊欄：")
-                    c1, c2 = st.columns(2)
-                    c1.metric("最佳 Lambda3", f"{best_params['lam3']:.3f}")
-                    c2.metric("最佳 Rho (DC)", f"{best_params['rho']:.3f}")
-                else:
-                    st.error("校正收斂失敗，請檢查數據品質。")
+            if df_cal is not None:
+                st.write("預覽數據:", df_cal.head())
+                if st.button("⚡ 開始 MLE 擬合", type="primary"):
+                    with st.spinner("正在進行最大概似估計 (MLE)..."):
+                        best_params = fit_params_mle(df_cal)
+                    
+                    if best_params["success"]:
+                        st.success("校正成功！請將以下參數填入側邊欄：")
+                        c1, c2 = st.columns(2)
+                        c1.metric("最佳 Lambda3", f"{best_params['lam3']:.3f}")
+                        c2.metric("最佳 Rho (DC)", f"{best_params['rho']:.3f}")
+                    else:
+                        st.error("校正收斂失敗，請檢查數據品質。")
         except Exception as e:
             st.error(f"檔案讀取失敗: {e}")
-            st.info("請確認已安裝 openpyxl (若讀取 Excel) 並檢查檔案格式。")
+
     else:
         st.info("無數據時，可生成模擬數據進行測試。")
         if st.button("生成模擬測試數據"):
