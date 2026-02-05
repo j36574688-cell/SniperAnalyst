@@ -12,7 +12,7 @@ from functools import lru_cache
 from scipy.special import logsumexp, gammaln
 from scipy.optimize import minimize
 
-# [V40.1] 安全導入 Plotly (防崩潰 + 視覺化)
+# [V40.1] 安全導入 Plotly
 try:
     import plotly.express as px
     import plotly.graph_objects as go
@@ -20,7 +20,7 @@ try:
 except ImportError:
     HAS_PLOTLY = False
 
-# [V38] Numba JIT 加速
+# [V38] Numba JIT
 try:
     from numba import njit, prange
     HAS_NUMBA = True
@@ -32,7 +32,7 @@ except ImportError:
     def prange(n): return range(n)
 
 # =========================
-# 1. 核心數學工具
+# 1. 核心數學工具 (Kernel)
 # =========================
 EPS = 1e-15
 
@@ -157,17 +157,13 @@ class RegimeMemory:
         if roi > 0.05: return 1.1
         return 1.0
 
-# [V40.2] Data Editor Compatible System
 class PaperTradingSystem:
     def __init__(self, file_path="my_bets.csv"):
         self.file_path = file_path
         
     def load_bets(self):
         if os.path.exists(self.file_path):
-            try:
-                return pd.read_csv(self.file_path)
-            except:
-                return pd.DataFrame(columns=["Date", "Selection", "Odds", "Stake", "Result", "PnL"])
+            return pd.read_csv(self.file_path)
         return pd.DataFrame(columns=["Date", "Selection", "Odds", "Stake", "Result", "PnL"])
         
     def add_bet(self, selection, odds, stake):
@@ -199,7 +195,7 @@ class PaperTradingSystem:
                 df.at[idx, 'PnL'] = 0.0
             else:
                 df.at[idx, 'PnL'] = 0.0 # Pending
-        
+                
         df.to_csv(self.file_path, index=False)
     
     def get_stats(self):
@@ -350,53 +346,36 @@ class SniperAnalystLogic:
         return {"est": float(est)}
 
 # =========================
-# 4. 資料處理工具 (V40.3 強力讀取版)
+# 4. 資料處理工具
 # =========================
 def preprocess_uploaded_data(df: pd.DataFrame) -> pd.DataFrame:
-    # 1. 強制清除欄位空白
-    df.columns = [str(c).strip() for c in df.columns]
-    
-    # 2. 萬用對映表 (大小寫不敏感)
     col_map = {
-        'hometeam': 'home', 'home': 'home', 'ht': 'home', 'team1': 'home',
-        'awayteam': 'away', 'away': 'away', 'at': 'away', 'team2': 'away',
-        'fthg': 'home_goals', 'hg': 'home_goals', 'homegoals': 'home_goals', 'score1': 'home_goals',
-        'ftag': 'away_goals', 'ag': 'away_goals', 'awaygoals': 'away_goals', 'score2': 'away_goals',
-        'div': 'div', 'date': 'date'
+        'HomeTeam': 'home', 'Home': 'home', 'HT': 'home',
+        'AwayTeam': 'away', 'Away': 'away', 'AT': 'away',
+        'FTHG': 'home_goals', 'HG': 'home_goals', 'HomeGoals': 'home_goals',
+        'FTAG': 'away_goals', 'AG': 'away_goals', 'AwayGoals': 'away_goals',
+        'Div': 'div', 'Date': 'date'
     }
-    
+    df.columns = [c.strip() for c in df.columns]
     new_cols = {}
     for col in df.columns:
-        c_lower = col.lower().replace(" ", "").replace("_", "")
-        if c_lower in col_map:
-            new_cols[col] = col_map[c_lower]
-    
+        for k, v in col_map.items():
+            if col.lower() == k.lower():
+                new_cols[col] = v; break
     df = df.rename(columns=new_cols)
-    
-    # 3. 檢查並回報缺失
     required = ['home', 'away', 'home_goals', 'away_goals']
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        # 這裡不報錯，而是回傳空 DF 讓外層處理
+    if any(c not in df.columns for c in required):
+        st.error(f"❌ 缺少關鍵欄位: {required}")
         return pd.DataFrame()
-
-    # 4. 自動補全 lh_pred (如果沒有)
     if 'lh_pred' not in df.columns or 'la_pred' not in df.columns:
-        avg_h = df['home_goals'].mean()
-        avg_a = df['away_goals'].mean()
-        # 使用全域平均填補
-        df['lh_pred'] = avg_h
-        df['la_pred'] = avg_a
-        
-        # 嘗試使用 Rolling Mean (如果有足夠數據)
+        avg_h, avg_a = df['home_goals'].mean(), df['away_goals'].mean()
+        df['lh_pred'] = avg_h; df['la_pred'] = avg_a
         try:
             h_roll = df.groupby('home')['home_goals'].transform(lambda x: x.shift().expanding().mean())
             a_roll = df.groupby('away')['away_goals'].transform(lambda x: x.shift().expanding().mean())
             df['lh_pred'] = h_roll.fillna(avg_h)
             df['la_pred'] = a_roll.fillna(avg_a)
-        except:
-            pass # 失敗就用全域平均
-            
+        except: pass
     return df
 
 def fit_params_mle(df):
@@ -482,9 +461,9 @@ def plot_calendar_heatmap(df_bets):
     return fig
 
 # =========================
-# 5. UI (V40.3 Robust & Settlement)
+# 5. UI (V40.2 Settlement)
 # =========================
-st.set_page_config(page_title="Sniper V40.3", page_icon="🧿", layout="wide")
+st.set_page_config(page_title="Sniper V40.2", page_icon="🧿", layout="wide")
 st.markdown("<style>.metric-box { background-color: #f0f2f6; padding: 10px; border-radius: 8px; text-align: center; } .stProgress > div > div > div > div { background-color: #4CAF50; }</style>", unsafe_allow_html=True)
 
 # 初始化
@@ -492,8 +471,8 @@ ptrader = PaperTradingSystem()
 if "cart" not in st.session_state: st.session_state.cart = []
 
 with st.sidebar:
-    st.title("🧿 Sniper V40.3")
-    st.caption("Robust Edition")
+    st.title("🧿 Sniper V40.2")
+    st.caption("Settlement Edition")
     if HAS_NUMBA: st.success("⚡ Numba 加速：已啟動")
     else: st.warning("⚠️ Numba 加速：未啟動")
     
@@ -701,52 +680,14 @@ elif app_mode == "🛡️ 風險對沖實驗室":
         else: st.warning("需先執行預測")
 
 elif app_mode == "🔧 參數校正實驗室":
-    st.header("🔧 參數校正 (V40.3 強力讀取)")
-    
-    # [V40.3] 多檔強力讀取
-    files = st.file_uploader("上傳 CSV/Excel (支援 Big5/Latin-1)", accept_multiple_files=True)
+    st.header("🔧 參數校正")
+    files = st.file_uploader("CSV/Excel", accept_multiple_files=True)
     if files:
-        dfs = []
-        for f in files:
-            try:
-                # 嘗試多種編碼讀取
-                if f.name.endswith('.csv'):
-                    try:
-                        df = pd.read_csv(f, encoding='utf-8')
-                    except UnicodeDecodeError:
-                        f.seek(0)
-                        try:
-                            df = pd.read_csv(f, encoding='big5')
-                        except UnicodeDecodeError:
-                            f.seek(0)
-                            df = pd.read_csv(f, encoding='latin-1')
-                else:
-                    df = pd.read_excel(f)
-                
-                # 預處理
-                df = preprocess_uploaded_data(df)
-                if not df.empty: dfs.append(df)
-            except Exception as e:
-                st.warning(f"檔案 {f.name} 讀取失敗: {e}")
-        
-        if dfs:
-            full = pd.concat(dfs, ignore_index=True)
-            st.write(f"成功合併 {len(full)} 筆數據 (自動補全 lh_pred)", full.head(3))
-            
-            c1, c2 = st.columns(2)
-            with c1:
-                if st.button("⚡ MLE"):
-                    r = fit_params_mle(full)
-                    if r["success"]:
-                        st.success(f"建議參數: Lam3={r['lam3']:.2f}, Rho={r['rho']:.2f}, HA={r['home_adv']:.2f}")
-                    else:
-                        st.error("校正收斂失敗 (可能是數據量不足或欄位錯誤)")
-            with c2:
-                if st.button("📈 Kalman"):
-                    h, _ = run_kalman_tracking(full)
-                    st.dataframe(h.tail())
-        else:
-            st.error("沒有成功讀取任何有效數據，請檢查 CSV 欄位名稱 (需包含 HomeTeam, AwayTeam, FTHG, FTAG)。")
+        dfs = [preprocess_uploaded_data(pd.read_csv(f) if f.name.endswith('.csv') else pd.read_excel(f)) for f in files]
+        full = pd.concat([d for d in dfs if not d.empty])
+        if st.button("⚡ MLE"):
+            r = fit_params_mle(full)
+            if r["success"]: st.success(f"L3={r['lam3']:.2f}, R={r['rho']:.2f}, H={r['home_adv']:.2f}")
 
 # [MODE 4: 實戰績效回顧 (Settlement Upgrade)]
 elif app_mode == "📈 實戰績效回顧":
