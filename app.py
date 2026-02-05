@@ -12,7 +12,7 @@ from functools import lru_cache
 from scipy.special import logsumexp, gammaln
 from scipy.optimize import minimize
 
-# [V40.6] 安全導入 Plotly
+# [V41.0] 安全導入 Plotly
 try:
     import plotly.express as px
     import plotly.graph_objects as go
@@ -189,10 +189,16 @@ class PaperTradingSystem:
             res = row['Result']
             stake = float(row['Stake'])
             odds = float(row['Odds'])
-            if res == "Win": df.at[idx, 'PnL'] = stake * (odds - 1)
-            elif res == "Lose": df.at[idx, 'PnL'] = -stake
-            elif res == "Void": df.at[idx, 'PnL'] = 0.0
-            else: df.at[idx, 'PnL'] = 0.0
+            
+            if res == "Win":
+                df.at[idx, 'PnL'] = stake * (odds - 1)
+            elif res == "Lose":
+                df.at[idx, 'PnL'] = -stake
+            elif res == "Void":
+                df.at[idx, 'PnL'] = 0.0
+            else:
+                df.at[idx, 'PnL'] = 0.0 # Pending
+        
         df.to_csv(self.file_path, index=False)
     
     def get_stats(self):
@@ -455,9 +461,9 @@ def plot_calendar_heatmap(df_bets):
     return fig
 
 # =========================
-# 5. UI (V40.6 Grand Fix)
+# 5. UI (V41.0 Perfection)
 # =========================
-st.set_page_config(page_title="Sniper V40.6", page_icon="🧿", layout="wide")
+st.set_page_config(page_title="Sniper V41.0", page_icon="🧿", layout="wide")
 st.markdown("<style>.metric-box { background-color: #f0f2f6; padding: 10px; border-radius: 8px; text-align: center; } .stProgress > div > div > div > div { background-color: #4CAF50; }</style>", unsafe_allow_html=True)
 
 # 初始化
@@ -465,8 +471,8 @@ ptrader = PaperTradingSystem()
 if "cart" not in st.session_state: st.session_state.cart = []
 
 with st.sidebar:
-    st.title("🧿 Sniper V40.6")
-    st.caption("Grand Fix Edition")
+    st.title("🧿 Sniper V41.0")
+    st.caption("Perfection Edition")
     if HAS_NUMBA: st.success("⚡ Numba 加速：已啟動")
     else: st.warning("⚠️ Numba 加速：未啟動")
     
@@ -509,7 +515,7 @@ with st.sidebar:
         show_unc = st.toggle("顯示區間", True)
 
 if app_mode == "🎯 單場深度預測":
-    st.header("🎯 單場深度預測 (V40)")
+    st.header("🎯 單場深度預測 (V41)")
     if "analysis_results" not in st.session_state: st.session_state.analysis_results = None
     
     t1, t2 = st.tabs(["📋 貼上 JSON", "📂 上傳 JSON"])
@@ -572,7 +578,7 @@ if app_mode == "🎯 單場深度預測":
                     candidates.append({"pick": tag, "odds": o, "ev": adj_ev, "kelly": kelly, "type": "1x2", "prob": p, "sharpe": sharpe})
             st.dataframe(pd.DataFrame(r_1x2), use_container_width=True)
             
-            # [V40.6] 亞盤優化 - 顯示「誰讓分」
+            # [V41.0] 亞盤優化 - 顯示「誰讓分」
             c_ah, c_ou = st.columns(2)
             with c_ah:
                 st.subheader("亞盤 (AH)")
@@ -586,7 +592,6 @@ if app_mode == "🎯 單場深度預測":
                     kel = calc_risk_adj_kelly(adj, var, risk_scale, p_approx)
                     amt = unit_stake * (kel/100.0)
                     
-                    # 判斷讓分方
                     if hcap < 0: tag_str = f"主讓 {hcap}"
                     elif hcap > 0: tag_str = f"主受 +{hcap}"
                     else: tag_str = "平手盤"
@@ -648,6 +653,14 @@ if app_mode == "🎯 單場深度預測":
         with t_sim:
             hw = np.sum(res["sh"] > res["sa"]) / 500000
             st.metric("MC 主勝", f"{hw:.1%}")
+            
+            # [V41.0] 極速模擬圖表
+            fig, ax = plt.subplots(figsize=(6,2))
+            ax.hist(res["sh"], alpha=0.5, label="Home", bins=range(8), density=True)
+            ax.hist(res["sa"], alpha=0.5, label="Away", bins=range(8), density=True)
+            ax.legend()
+            st.pyplot(fig)
+            
             ce_res = eng.run_ce_importance_sampling(M, 4.5)
             st.metric("大 4.5 機率", f"{ce_res['est']:.2%}")
 
@@ -678,10 +691,11 @@ if app_mode == "🎯 單場深度預測":
 
 elif app_mode == "🛡️ 風險對沖實驗室":
     st.title("🛡️ 風險對沖實驗室")
-    # [V40.6] 恢復完整功能與中文化
     tab_arb, tab_lay, tab_port = st.tabs(["⚡ 1x2 套利", "📉 交易所對沖", "📊 智能組合優化"])
     
     with tab_arb:
+        st.subheader("無風險套利計算 (Arbitrage)")
+        st.markdown("輸入三家不同博彩公司的賠率，尋找無風險利潤空間。")
         c1, c2, c3 = st.columns(3)
         o1 = c1.number_input("主勝賠率", 2.0); o2 = c2.number_input("和局賠率", 3.0); o3 = c3.number_input("客勝賠率", 4.0)
         inv = 1/o1+1/o2+1/o3
@@ -689,6 +703,8 @@ elif app_mode == "🛡️ 風險對沖實驗室":
         else: st.info(f"無套利空間 (Book: {inv:.2%})")
 
     with tab_lay:
+        st.subheader("交易所對沖計算器 (Back-Lay)")
+        st.markdown("計算在 Betfair 等交易所進行對沖所需的 Lay 金額。")
         c1, c2 = st.columns(2)
         b_o = c1.number_input("Back 賠率", 1.01, 10.0, 2.5)
         stake = c1.number_input("Back 本金", 10, 1000, 100)
@@ -699,6 +715,8 @@ elif app_mode == "🛡️ 風險對沖實驗室":
             st.metric("建議 Lay 金額", f"${lay_s:.2f}")
 
     with tab_port:
+        st.subheader("智能組合優化 (Portfolio Optimization)")
+        st.markdown("利用 Markowitz 現代投資組合理論，計算最佳資金分配比例。")
         if st.session_state.get("analysis_results"):
             res = st.session_state.analysis_results
             sh, sa = res["sh"], res["sa"]
@@ -715,7 +733,7 @@ elif app_mode == "🛡️ 風險對沖實驗室":
                 ret = np.dot(opt.x, mu)*100
                 st.markdown(f"""<div style='background:#f0f2f6;padding:10px;color:black'>
                 <b>首席分析師:</b> 預期回報 {ret:.2f}%。建議 {"分散配置以降低波動" if max(opt.x)<0.7 else "集中單打高價值選項"}。</div>""", unsafe_allow_html=True)
-        else: st.warning("請先執行單場預測")
+        else: st.warning("需先執行預測")
 
 elif app_mode == "🔧 參數校正實驗室":
     st.header("🔧 參數校正")
@@ -727,14 +745,14 @@ elif app_mode == "🔧 參數校正實驗室":
             r = fit_params_mle(full)
             if r["success"]: st.success(f"Lam3={r['lam3']:.2f}, Rho={r['rho']:.2f}, HA={r['home_adv']:.2f}")
 
-# [MODE 4: 實戰績效回顧 (Fixed Crash)]
+# [MODE 4: 實戰績效回顧 (Fixed)]
 elif app_mode == "📈 實戰績效回顧":
     st.title("📈 實戰績效回顧")
     df = ptrader.load_bets()
     
     if not df.empty:
         st.markdown("### 📝 注單管理 (直接點擊表格修改)")
-        # [V40.6 Fix] Corrected SelectboxColumn
+        # [V41.0 Fix] Corrected SelectboxColumn
         edited_df = st.data_editor(
             df,
             column_config={
