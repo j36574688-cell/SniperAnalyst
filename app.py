@@ -78,7 +78,7 @@ def get_matrix_cached(lh: float, la: float, max_g: int, nb_alpha: float) -> np.n
     return M / M.sum()
 
 # =========================
-# 2. 全景記憶體系
+# 2. 全景記憶體系 (Fixed)
 # =========================
 class RegimeMemory:
     def __init__(self):
@@ -108,7 +108,7 @@ class RegimeMemory:
         return 1.0
 
 # =========================
-# 3. 分析引擎邏輯
+# 3. 分析引擎邏輯 (V37.0 Omni-Engine)
 # =========================
 class SniperAnalystLogic:
     def __init__(self, json_data: Any, max_g: int = 9, nb_alpha: float = 0.12, lam3: float = 0.0, rho: float = -0.13):
@@ -123,7 +123,7 @@ class SniperAnalystLogic:
         self.memory = RegimeMemory()
 
     def calc_lambda(self) -> Tuple[float, float, bool]:
-        """計算 Lambda"""
+        """計算 Lambda (含近況加權)"""
         league_base = 1.35
         is_weighted = False
         def att_def_w(team):
@@ -150,10 +150,11 @@ class SniperAnalystLogic:
                (la_att * lh_def / league_base), is_weighted
 
     def build_matrix_v37(self, lh: float, la: float, use_biv: bool = True, use_dc: bool = True) -> Tuple[np.ndarray, Dict]:
-        """[V37] 全能矩陣生成"""
+        """[V37] 全能矩陣生成 (Log-Space Bivariate + Dixon-Coles)"""
         G = self.max_g
         M_model = np.zeros((G, G), dtype=float)
         
+        # 1. 物理層 (Log-Space 計算)
         eff_lam3 = max(self.lam3, 0.001) if use_biv else 0.0
         l1 = max(0.01, lh - eff_lam3)
         l2 = max(0.01, la - eff_lam3)
@@ -163,6 +164,7 @@ class SniperAnalystLogic:
                 log_p = biv_poisson_logpmf(i, j, l1, l2, eff_lam3)
                 M_model[i, j] = math.exp(log_p)
 
+        # 2. Dixon-Coles 修正
         if use_dc:
             def tau(x, y, mu_h, mu_a, rho):
                 if x==0 and y==0: return 1.0 - (mu_h * mu_a * rho)
@@ -177,6 +179,7 @@ class SniperAnalystLogic:
 
         M_model /= M_model.sum()
 
+        # 3. 市場混合層
         true_imp = get_true_implied_prob(self.market["1x2_odds"])
         p_h = float(np.sum(np.tril(M_model, -1)))
         p_d = float(np.sum(np.diag(M_model)))
@@ -306,9 +309,9 @@ def fit_params_mle(history_df: pd.DataFrame) -> Dict[str, float]:
     return {"lam3": result.x[0], "rho": result.x[1], "success": result.success}
 
 # =========================
-# 5. Streamlit UI (V37.4 Obsidian - Forced Black Text)
+# 5. Streamlit UI (V37.5 Universal Reader)
 # =========================
-st.set_page_config(page_title="Sniper V37.4", page_icon="🧿", layout="wide")
+st.set_page_config(page_title="Sniper V37.5", page_icon="🧿", layout="wide")
 
 st.markdown("""
 <style>
@@ -318,8 +321,8 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 with st.sidebar:
-    st.title("🧿 Sniper V37.4")
-    st.caption("Obsidian Edition")
+    st.title("🧿 Sniper V37.5")
+    st.caption("Universal Reader Edition")
     st.markdown("---")
     app_mode = st.radio("功能模式：", ["🎯 單場深度預測", "🛡️ 風險對沖實驗室", "🔧 參數校正實驗室", "📈 聯賽歷史回測", "📚 劇本查詢"])
     st.divider()
@@ -626,23 +629,41 @@ elif app_mode == "🛡️ 風險對沖實驗室":
         else:
             st.warning("⚠️ 請先在「單場深度預測」執行分析，以生成模擬數據。")
 
+# =========================
+# 模式 3: 參數校正實驗室
+# =========================
 elif app_mode == "🔧 參數校正實驗室":
     st.header("🔧 參數校正實驗室 (Auto-Calibration)")
     st.markdown("利用 `scipy.optimize` 尋找歷史數據中的最佳 Lambda3 (共變異) 與 Rho (DC校正)")
-    cal_file = st.file_uploader("上傳含有 lh_pred, la_pred, home_goals, away_goals 的 CSV", type=['csv'])
+    
+    cal_file = st.file_uploader("上傳含有 lh_pred, la_pred, home_goals, away_goals 的 CSV 或 Excel", type=['csv', 'xlsx'])
+    
     if cal_file:
-        df_cal = pd.read_csv(cal_file)
-        st.write("預覽數據:", df_cal.head())
-        if st.button("⚡ 開始 MLE 擬合", type="primary"):
-            with st.spinner("正在進行最大概似估計 (MLE)..."):
-                best_params = fit_params_mle(df_cal)
-            if best_params["success"]:
-                st.success("校正成功！請將以下參數填入側邊欄：")
-                c1, c2 = st.columns(2)
-                c1.metric("最佳 Lambda3", f"{best_params['lam3']:.3f}")
-                c2.metric("最佳 Rho (DC)", f"{best_params['rho']:.3f}")
+        try:
+            if cal_file.name.endswith('.csv'):
+                try:
+                    df_cal = pd.read_csv(cal_file, encoding='utf-8')
+                except UnicodeDecodeError:
+                    cal_file.seek(0)
+                    df_cal = pd.read_csv(cal_file, encoding='big5')
             else:
-                st.error("校正收斂失敗，請檢查數據品質。")
+                df_cal = pd.read_excel(cal_file)
+            
+            st.write("預覽數據:", df_cal.head())
+            if st.button("⚡ 開始 MLE 擬合", type="primary"):
+                with st.spinner("正在進行最大概似估計 (MLE)..."):
+                    best_params = fit_params_mle(df_cal)
+                
+                if best_params["success"]:
+                    st.success("校正成功！請將以下參數填入側邊欄：")
+                    c1, c2 = st.columns(2)
+                    c1.metric("最佳 Lambda3", f"{best_params['lam3']:.3f}")
+                    c2.metric("最佳 Rho (DC)", f"{best_params['rho']:.3f}")
+                else:
+                    st.error("校正收斂失敗，請檢查數據品質。")
+        except Exception as e:
+            st.error(f"檔案讀取失敗: {e}")
+            st.info("請確認已安裝 openpyxl (若讀取 Excel) 並檢查檔案格式。")
     else:
         st.info("無數據時，可生成模擬數據進行測試。")
         if st.button("生成模擬測試數據"):
@@ -655,6 +676,9 @@ elif app_mode == "🔧 參數校正實驗室":
             st.dataframe(mock_df)
             st.caption("請將此表格複製並存為 CSV 上傳。")
 
+# =========================
+# 模式 4 & 5
+# =========================
 elif app_mode == "📈 聯賽歷史回測":
     st.title("📈 聯賽歷史回測")
     st.info("請將 CSV 檔案放入資料夾後，使用 V37 Batch Engine 進行測試。")
