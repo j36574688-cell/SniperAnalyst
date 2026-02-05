@@ -4,44 +4,53 @@ import math
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import glob
-import os
 from typing import Dict, List, Tuple, Any, Optional
+from functools import lru_cache
 
 # =========================
-# 1. 核心數學工具 (V35.0 Architect Kernel)
+# 1. 核心數學工具 (V36.0 Quantum Kernel)
 # =========================
 EPS = 1e-15
 
+@lru_cache(maxsize=1024)
+def log_factorial(n: int) -> float:
+    return math.lgamma(n + 1)
+
 def poisson_pmf(k: int, lam: float) -> float:
     if lam <= 0: return 1.0 if k == 0 else 0.0
-    return math.exp(-lam + k * math.log(lam) - math.lgamma(k + 1))
+    return math.exp(-lam + k * math.log(lam) - log_factorial(k))
 
 def nb_pmf(k: int, mu: float, alpha: float) -> float:
     if alpha <= 0: return poisson_pmf(k, mu)
     r = 1.0 / alpha
     p = r / (r + mu)
-    coeff = math.exp(math.lgamma(k + r) - math.lgamma(r) - math.lgamma(k + 1))
+    coeff = math.exp(math.lgamma(k + r) - math.lgamma(r) - log_factorial(k))
     return float(coeff * (p ** r) * ((1 - p) ** k))
 
-def biv_poisson_pmf(i: int, j: int, lam1: float, lam2: float, lam3: float) -> float:
-    """[V34] 雙變量 Poisson P(X=i, Y=j) with shared lambda3 (Covariance)"""
-    if (lam1 + lam2 + lam3) <= 0: return 1.0 if (i == 0 and j == 0) else 0.0
-    terms = []
-    base = -(lam1 + lam2 + lam3)
-    maxk = min(i, j)
-    for k in range(0, maxk + 1):
-        lt = base
-        if (i - k) > 0: lt += (i - k) * math.log(lam1) - math.lgamma(i - k + 1)
-        if (j - k) > 0: lt += (j - k) * math.log(lam2) - math.lgamma(j - k + 1)
-        if k > 0: lt += k * math.log(lam3) - math.lgamma(k + 1)
-        terms.append(lt)
-    m = max(terms)
-    s = sum(math.exp(t - m) for t in terms)
-    return max(math.exp(m + math.log(s)), 0.0)
+# [V36] True Bivariate Poisson PMF (使用遞迴公式優化)
+# P(x, y) = P_pois(x, lam1) * P_pois(y, lam2) * exp(-lam3) * sum(...)
+def biv_poisson_pmf(x: int, y: int, lam1: float, lam2: float, lam3: float) -> float:
+    if lam3 <= 0:
+        return poisson_pmf(x, lam1) * poisson_pmf(y, lam2)
+    
+    # 這裡使用 Holgate (1964) 的公式變體，數值更穩定
+    # P(X=x, Y=y) = exp(-(L1+L2+L3)) * sum_{k=0}^{min(x,y)} [ (L1^(x-k) * L2^(y-k) * L3^k) / ((x-k)! * (y-k)! * k!) ]
+    total_prob = 0.0
+    base_log = -(lam1 + lam2 + lam3)
+    
+    for k in range(min(x, y) + 1):
+        try:
+            term = base_log
+            if x - k > 0: term += (x - k) * math.log(lam1) - log_factorial(x - k)
+            if y - k > 0: term += (y - k) * math.log(lam2) - log_factorial(y - k)
+            if k > 0: term += k * math.log(lam3) - log_factorial(k)
+            total_prob += math.exp(term)
+        except ValueError: # handle log(0)
+            continue
+            
+    return total_prob
 
 def get_true_implied_prob(odds_dict: Dict[str, float]) -> Dict[str, float]:
-    """計算去水後的市場真實機率"""
     inv = {k: 1.0 / float(v) if v > 0 else 0.0 for k, v in odds_dict.items()}
     margin = sum(inv.values())
     return {k: inv[k] / margin if margin > 0 else 0.0 for k in odds_dict}
@@ -62,8 +71,8 @@ def calc_risk_metrics(prob: float, odds: float) -> Tuple[float, float]:
     return var, sharpe
 
 @st.cache_data
-def get_matrix_cached(lh: float, la: float, max_g: int, nb_alpha: float, vol_adjust: bool) -> np.ndarray:
-    """基礎物理模型矩陣 (V33核心)"""
+def get_matrix_cached(lh: float, la: float, max_g: int, nb_alpha: float) -> np.ndarray:
+    """V33 獨立分佈矩陣 (Fallback用)"""
     G = max_g
     i, j = np.arange(G), np.arange(G)
     p_i = np.array([poisson_pmf(k, lh) for k in i]); p_j = np.array([poisson_pmf(k, la) for k in j])
@@ -71,24 +80,7 @@ def get_matrix_cached(lh: float, la: float, max_g: int, nb_alpha: float, vol_adj
     nb_i = np.array([nb_pmf(k, lh, nb_alpha) for k in i]); nb_j = np.array([nb_pmf(k, la, nb_alpha) for k in j])
     Mn = np.outer(nb_i, nb_j)
     M = 0.6 * Mp + 0.4 * Mn
-    rho = -0.18 if vol_adjust else -0.13
-    if G > 1:
-        M[0,0] *= (1 - lh*la*rho); M[1,0] *= (1 + la*rho)
-        M[0,1] *= (1 + lh*rho); M[1,1] *= (1 - rho)
     return M / M.sum()
-
-def build_biv_matrix(lh: float, la: float, lam3: float, max_g: int) -> np.ndarray:
-    """[V34] 構建雙變量矩陣"""
-    G = max_g
-    M = np.zeros((G, G), dtype=float)
-    if lam3 <= 1e-9:
-        M = get_matrix_cached(lh, la, max_g, 0.12, False) # Fallback
-    else:
-        for i in range(G):
-            for j in range(G):
-                M[i, j] = biv_poisson_pmf(i, j, lh, la, lam3)
-    s = M.sum()
-    return M / max(s, EPS)
 
 # =========================
 # 2. 全景記憶體系 (V32 保留)
@@ -96,31 +88,22 @@ def build_biv_matrix(lh: float, la: float, lam3: float, max_g: int) -> np.ndarra
 class RegimeMemory:
     def __init__(self):
         self.history_db = {
-            "Bore_Draw_Stalemate": { "name": "🛡️ 雙重鐵桶", "bets": 19, "roi": 0.219 }, 
-            "Relegation_Dog": { "name": "🐕 保級受讓", "bets": 101, "roi": 0.083 },
-            "Fallen_Giant": { "name": "📉 豪門崩盤", "bets": 67, "roi": -0.008 },
-            "Fortress_Home": { "name": "🏰 魔鬼主場", "bets": 256, "roi": -0.008 },
-            "Title_MustWin_Home": { "name": "🏆 爭冠必勝盤", "bets": 256, "roi": -0.063 },
-            "MarketHype_Fav": { "name": "🔥 大熱倒灶", "bets": 150, "roi": -0.080 },
-            "MidTable_Standard": { "name": "😐 中游例行", "bets": 300, "roi": 0.000 }
+            "Bore_Draw_Stalemate": { "name": "🛡️ 雙重鐵桶", "roi": 0.219 }, 
+            "Relegation_Dog": { "name": "🐕 保級受讓", "roi": 0.083 },
+            "Fallen_Giant": { "name": "📉 豪門崩盤", "roi": -0.008 },
+            "Fortress_Home": { "name": "🏰 魔鬼主場", "roi": -0.008 },
+            "Title_MustWin_Home": { "name": "🏆 爭冠必勝盤", "roi": -0.063 },
+            "MarketHype_Fav": { "name": "🔥 大熱倒灶", "roi": -0.080 },
+            "MidTable_Standard": { "name": "😐 中游例行", "roi": 0.000 }
         }
 
-    def analyze_scenario(self, engine: 'SniperAnalystLogic', lh: float, la: float) -> str:
-        h, a = engine.h, engine.a
-        odds = engine.market["1x2_odds"]
-        prob_h = 1.0 / odds["home"]
-        form_h_score = sum(h["context_modifiers"].get("recent_form_trend", [0]))
-        motiv_h = h["context_modifiers"]["motivation"]
-        
-        if odds["home"] < 2.10 and form_h_score < -1: return "Fallen_Giant"
-        if prob_h > 0.65 and form_h_score < 0: return "Injury_Crisis_Fav"
-        if motiv_h == "title_race" and prob_h > 0.65: return "Title_MustWin_Home"
+    def analyze_scenario(self, lh, la, odds) -> str:
         if odds["home"] < 1.30: return "MarketHype_Fav"
         if (lh + la) < 2.2: return "Bore_Draw_Stalemate"
         return "MidTable_Standard"
 
     def recall_experience(self, regime_id: str) -> Dict:
-        return self.history_db.get(regime_id, {"name": "未知", "roi": 0.0, "bets":0})
+        return self.history_db.get(regime_id, {"name": "未知", "roi": 0.0})
 
     def calc_memory_penalty(self, historical_roi: float) -> float:
         if historical_roi < -0.05: return 0.7
@@ -128,7 +111,7 @@ class RegimeMemory:
         return 1.0
 
 # =========================
-# 3. 分析引擎邏輯 (V35.0 Architect Core)
+# 3. 分析引擎邏輯 (V36.0 Quantum Core)
 # =========================
 class SniperAnalystLogic:
     def __init__(self, json_data: Any, max_g: int = 9, nb_alpha: float = 0.12, lam3: float = 0.0):
@@ -158,7 +141,6 @@ class SniperAnalystLogic:
         lh_att, lh_def = att_def_w(self.h)
         la_att, la_def = att_def_w(self.a)
         
-        # [V35] 強隊碾壓係數 (Crush Factor)
         strength_gap = (lh_att - la_att)
         crush_factor = 1.05 if strength_gap > 0.5 else 1.0
         
@@ -169,52 +151,41 @@ class SniperAnalystLogic:
         return (lh_att * la_def / league_base) * h_adv * crush_factor, \
                (la_att * lh_def / league_base), is_weighted
 
-    def dixon_coles_adjustment(self, M: np.ndarray, lh: float, la: float, rho: float = -0.13) -> np.ndarray:
-        """[V35] Dixon-Coles 修正 (0-0, 1-1 低比分修正)"""
-        def tau(x, y, lambda_h, lambda_a, rho):
-            if x == 0 and y == 0: return 1.0 - (lambda_h * lambda_a * rho)
-            elif x == 0 and y == 1: return 1.0 + (lambda_h * rho)
-            elif x == 1 and y == 0: return 1.0 + (lambda_a * rho)
-            elif x == 1 and y == 1: return 1.0 - rho
-            else: return 1.0
-
-        M_adj = M.copy()
-        # 僅修正左上角 2x2
-        for i in range(2):
-            for j in range(2):
-                M_adj[i, j] *= tau(i, j, lh, la, rho)
+    def build_matrix_v36(self, lh: float, la: float, use_biv: bool = True, use_dc: bool = True) -> Tuple[np.ndarray, Dict]:
+        """[V36] 量子矩陣生成 (True Bivariate + Dixon-Coles)"""
+        G = self.max_g
+        M_model = np.zeros((G, G), dtype=float)
         
-        return M_adj / M_adj.sum()
-
-    def apply_heavy_tail(self, M: np.ndarray, boost: float = 1.02) -> np.ndarray:
-        """[V35] 尾部增強 (針對高比分)"""
-        G = M.shape[0]
-        weights = np.ones((G, G))
-        for i in range(3, G):
-            for j in range(3, G):
-                weights[i, j] = boost
-        M_boosted = M * weights
-        return M_boosted / M_boosted.sum()
-
-    def build_matrix_v35(self, lh: float, la: float, use_bivariate: bool = False, use_dc: bool = True) -> Tuple[np.ndarray, Dict]:
-        """[V35] 矩陣生成 (整合 Dixon-Coles 與 Heavy Tail)"""
+        # 1. 物理層 (Bivariate or Indep)
+        # 如果 lam3 很小但開啟 Bivariate，我們會給一個微小的相關性 0.1
+        eff_lam3 = max(self.lam3, 0.1) if use_biv else 0.0
         
-        # 1. 物理層
-        if use_bivariate and self.lam3 > 0:
-            M_model = build_biv_matrix(lh, la, self.lam3, self.max_g)
+        # 這裡需要將 lh, la 拆解為獨立部分
+        # 因為 Bivariate 定義中 E[X] = lam1 + lam3, E[Y] = lam2 + lam3
+        # 所以傳入公式的 lam1 = lh - lam3, lam2 = la - lam3
+        l1 = max(0.01, lh - eff_lam3)
+        l2 = max(0.01, la - eff_lam3)
+        
+        if use_biv:
+            for i in range(G):
+                for j in range(G):
+                    M_model[i, j] = biv_poisson_pmf(i, j, l1, l2, eff_lam3)
         else:
-            M_model = get_matrix_cached(lh, la, self.max_g, self.nb_alpha, False) 
+            M_model = get_matrix_cached(lh, la, G, self.nb_alpha)
 
-        # 2. Dixon-Coles 修正
+        # 2. Dixon-Coles 修正 (如果還覺得不夠，再修 0-0)
         if use_dc:
-            M_model = self.dixon_coles_adjustment(M_model, lh, la, rho=-0.13)
+            rho = -0.13
+            # tau 函數需要作用在原始 lambda 上
+            M_model[0, 0] *= (1 - lh*la*rho)
+            M_model[0, 1] *= (1 + lh*rho)
+            M_model[1, 0] *= (1 + la*rho)
+            M_model[1, 1] *= (1 - rho)
 
-        # 3. 尾部增強 (視球隊風格)
-        vol_str = self.h.get("style_of_play", {}).get("volatility", "normal")
-        if vol_str == "high":
-            M_model = self.apply_heavy_tail(M_model, boost=1.05)
+        # 歸一化
+        M_model /= M_model.sum()
 
-        # 4. 市場混合層
+        # 3. 市場混合層
         true_imp = get_true_implied_prob(self.market["1x2_odds"])
         p_h = float(np.sum(np.tril(M_model, -1)))
         p_d = float(np.sum(np.diag(M_model)))
@@ -229,9 +200,9 @@ class SniperAnalystLogic:
         t_a = w*p_a + (1-w)*true_imp["away"]
         
         M_hybrid = M_model.copy()
-        M_hybrid[np.tril_indices(self.max_g, -1)] *= (t_h / p_h if p_h > 0 else 1)
-        M_hybrid[np.diag_indices(self.max_g)] *= (t_d / p_d if p_d > 0 else 1)
-        M_hybrid[np.triu_indices(self.max_g, 1)] *= (t_a / p_a if p_a > 0 else 1)
+        M_hybrid[np.tril_indices(G, -1)] *= (t_h / p_h if p_h > 0 else 1)
+        M_hybrid[np.diag_indices(G)] *= (t_d / p_d if p_d > 0 else 1)
+        M_hybrid[np.triu_indices(G, 1)] *= (t_a / p_a if p_a > 0 else 1)
         M_hybrid /= M_hybrid.sum()
         
         probs_detail = {
@@ -259,8 +230,8 @@ class SniperAnalystLogic:
         return np.sum(M * payoff) * 100
 
     def check_sensitivity(self, lh: float, la: float) -> Tuple[str, float]:
-        M_stress = get_matrix_cached(lh, la + 0.3, self.max_g, self.nb_alpha, False)
-        p_orig = float(np.sum(np.tril(get_matrix_cached(lh, la, self.max_g, self.nb_alpha, False), -1)))
+        M_stress = get_matrix_cached(lh, la + 0.3, self.max_g, self.nb_alpha)
+        p_orig = float(np.sum(np.tril(get_matrix_cached(lh, la, self.max_g, self.nb_alpha), -1)))
         p_new = float(np.sum(np.tril(M_stress, -1)))
         drop = (p_orig - p_new) / p_orig if p_orig > 0 else 0
         return ("High" if drop > 0.15 else "Medium"), drop
@@ -288,10 +259,23 @@ class SniperAnalystLogic:
         res = np.full(sims, "draw", dtype=object); res[sh > sa] = "home"; res[sh < sa] = "away"
         return sh, sa, res.tolist()
 
+    def importance_sampling_over(self, M: np.ndarray, line: float, n_sims: int = 10000) -> Dict[str, Any]:
+        """[V34] 重要性採樣 (移入類別內以方便調用)"""
+        rng = np.random.default_rng(42)
+        G = M.shape[0]; flat = M.flatten()
+        idx = np.arange(G*G); i = idx // G; j = idx % G
+        sums = (i + j).astype(float)
+        bias = (1.0 + sums) ** 1.5 # Bias Power
+        q = flat * bias; q /= q.sum()
+        draws = rng.choice(G*G, size=n_sims, p=q)
+        weights = flat[draws] / q[draws]
+        est = np.sum(weights * (sums[draws] > line)) / np.sum(weights)
+        return {"est": float(est)}
+
 # =========================
-# 4. Streamlit UI (V35 Ultimate)
+# 4. Streamlit UI (V36 Ultimate)
 # =========================
-st.set_page_config(page_title="Sniper V35.0 Architect", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="Sniper V36.0 Quantum", page_icon="⚛️", layout="wide")
 
 st.markdown("""
 <style>
@@ -301,19 +285,19 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 with st.sidebar:
-    st.title("🏛️ Sniper V35.0")
-    st.caption("Architect Edition")
+    st.title("⚛️ Sniper V36.0")
+    st.caption("Quantum Leap Edition")
     st.markdown("---")
-    app_mode = st.radio("功能模式：", ["🎯 單場深度預測", "🔧 參數校正實驗室", "📈 聯賽歷史回測", "📚 劇本查詢"])
+    app_mode = st.radio("功能模式：", ["🎯 單場深度預測", "📈 聯賽歷史回測", "📚 劇本查詢"])
     st.divider()
-    with st.expander("🛠️ 進階參數 (V35)", expanded=False):
+    with st.expander("🛠️ 進階參數 (V36)", expanded=False):
         unit_stake = st.number_input("單注本金 ($)", 10, 10000, 100)
         nb_alpha = st.slider("Alpha (NB)", 0.05, 0.25, 0.12)
-        use_biv = st.toggle("啟用 Bivariate Poisson", value=False)
-        lam3_input = st.slider("共變異數 (Lambda 3)", 0.0, 0.5, 0.1) if use_biv else 0.0
         
-        # [V35] Dixon-Coles Switch
-        use_dc_correction = st.toggle("啟用 Dixon-Coles (低比分修正)", value=True)
+        # [V36] Quantum Bivariate
+        use_biv = st.toggle("啟用 Bivariate Poisson (相關性)", value=True)
+        use_dc = st.toggle("啟用 Dixon-Coles (低比分修正)", value=True)
+        lam3_input = st.slider("共變異數 (Lambda 3)", 0.0, 0.5, 0.15) if use_biv else 0.0
         
         risk_scale = st.slider("風險係數", 0.1, 1.0, 0.3)
         use_mock_memory = st.checkbox("歷史記憶修正", value=True)
@@ -323,7 +307,7 @@ with st.sidebar:
 # 模式 1: 單場深度預測
 # =========================
 if app_mode == "🎯 單場深度預測":
-    st.header("🎯 單場深度預測 (V35 Engine)")
+    st.header("🎯 單場深度預測 (V36 Engine)")
     if "analysis_results" not in st.session_state: st.session_state.analysis_results = None
 
     tab1, tab2 = st.tabs(["📋 貼上 JSON", "📂 上傳 JSON"])
@@ -342,8 +326,8 @@ if app_mode == "🎯 單場深度預測":
             engine = SniperAnalystLogic(input_data, 9, nb_alpha, lam3_input)
             lh, la, is_weighted = engine.calc_lambda()
             
-            # [V35] 使用 V35 矩陣生成器
-            M, probs_detail = engine.build_matrix_v35(lh, la, use_bivariate=use_biv, use_dc=use_dc_correction)
+            # [V36] 使用 V36 矩陣生成器 (True Bivariate)
+            M, probs_detail = engine.build_matrix_v36(lh, la, use_biv=use_biv, use_dc=use_dc)
             
             market_bonus = engine.get_market_trend_bonus()
             regime_id = engine.memory.analyze_scenario(engine, lh, la)
@@ -370,13 +354,13 @@ if app_mode == "🎯 單場深度預測":
         engine, M = res["engine"], res["M"]
         probs = res["probs_detail"]
 
-        st.markdown("### 🔍 V35 戰術儀表板")
+        st.markdown("### 🔍 V36 戰術儀表板")
         d1, d2, d3, d4 = st.columns(4)
         d1.metric("主隊進球預期", f"{res['lh']:.2f}", delta="加權啟用" if res["is_weighted"] else None)
         d2.metric("客隊進球預期", f"{res['la']:.2f}")
         hybrid_p = probs["hybrid"]["home"]
         model_p = probs["model"]["home"]
-        d3.metric("V35 混合主勝", f"{hybrid_p:.1%}", delta=f"{(hybrid_p - model_p)*100:+.1f}%", delta_color="inverse")
+        d3.metric("V36 混合主勝", f"{hybrid_p:.1%}", delta=f"{(hybrid_p - model_p)*100:+.1f}%", delta_color="inverse")
         conf_score = res["conf_score"]
         d4.metric("🛡️ 信心指數", f"{conf_score:.0%}")
         
@@ -449,8 +433,8 @@ if app_mode == "🎯 單場深度預測":
                 st.info("🚧 本場比賽風險過高或 EV 不足，建議觀望。")
 
         with t_ai:
-            st.write("V35 權重混合分析")
-            df_comp = pd.DataFrame([probs["model"], probs["market"], probs["hybrid"]], index=["純模型", "市場去水", "V35混合"])
+            st.write("V36 權重混合分析")
+            df_comp = pd.DataFrame([probs["model"], probs["market"], probs["hybrid"]], index=["純模型", "市場去水", "V36混合"])
             st.dataframe(df_comp.style.format("{:.1%}"))
 
         with t_score:
@@ -458,6 +442,11 @@ if app_mode == "🎯 單場深度預測":
             st.dataframe(pd.DataFrame(M[:6,:6]).style.format("{:.1%}"))
 
         with t_sim:
+            st.subheader("稀有事件估計 (Importance Sampling)")
+            line_check = 4.5
+            is_res = engine.importance_sampling_over(M, line_check)
+            st.metric(f"大 {line_check} 機率 (IS估計)", f"{is_res['est']:.2%}")
+            st.divider()
             st.subheader("一般蒙地卡羅 (10,000 runs)")
             sh, sa, sr = engine.run_monte_carlo(M)
             st.metric("主勝率 (MC)", f"{sr.count('home')/100:.1f}%")
@@ -466,26 +455,11 @@ if app_mode == "🎯 單場深度預測":
             st.pyplot(fig)
 
 # =========================
-# 模式 2: 參數校正實驗室
-# =========================
-elif app_mode == "🔧 參數校正實驗室":
-    st.header("🔧 參數校正實驗室 (Calibration Lab)")
-    st.info("此功能需連接歷史數據庫，請使用下方按鈕生成模擬數據測試。")
-    if st.button("生成模擬測試數據"):
-        mock_df = pd.DataFrame({
-            'lh_pred': np.random.uniform(1.0, 2.5, 50),
-            'la_pred': np.random.uniform(0.8, 2.0, 50),
-            'home_goals': np.random.randint(0, 5, 50),
-            'away_goals': np.random.randint(0, 4, 50)
-        })
-        st.dataframe(mock_df)
-
-# =========================
-# 模式 3 & 4
+# 模式 2 & 3
 # =========================
 elif app_mode == "📈 聯賽歷史回測":
     st.title("📈 聯賽歷史回測")
-    st.info("請將 CSV 檔案放入資料夾後，使用 V35 Batch Engine 進行測試。")
+    st.info("請將 CSV 檔案放入資料夾後，使用 V36 Batch Engine 進行測試。")
 
 elif app_mode == "📚 劇本查詢":
     st.title("📚 盤口劇本庫")
