@@ -13,17 +13,18 @@ from scipy.optimize import minimize
 
 # [V38] 嘗試導入 Numba 進行 JIT 加速
 try:
-    from numba import njit
+    from numba import njit, prange
     HAS_NUMBA = True
 except ImportError:
     HAS_NUMBA = False
-    def njit(fastmath=False):
+    def njit(fastmath=False, parallel=False):
         def decorator(func):
             return func
         return decorator
+    def prange(n): return range(n)
 
 # =========================
-# 1. 核心數學工具 (V38.0 Omni-Kernel)
+# 1. 核心數學工具 (V38.3 Vectorized Kernel)
 # =========================
 EPS = 1e-15
 
@@ -66,6 +67,42 @@ def biv_poisson_logpmf_fast(x, y, lam1, lam2, lam3):
         
     return max_val + math.log(sum_exp)
 
+# [V38.3] 向量化 NLL 計算核心 (極速版)
+# 這個函數在 Numba 環境下運行，取代原本慢速的 Python for 迴圈
+@njit(fastmath=True, parallel=True)
+def compute_batch_nll(lh_arr, la_arr, h_arr, a_arr, lam3, rho, home_adv):
+    nll = 0.0
+    n = len(lh_arr)
+    
+    for i in prange(n):
+        # 參數應用
+        lh = lh_arr[i] * home_adv
+        la = la_arr[i]
+        h = h_arr[i]
+        a = a_arr[i]
+        
+        # 物理限制
+        l1 = max(0.01, lh - lam3)
+        l2 = max(0.01, la - lam3)
+        
+        # 計算 Log Probability
+        lp = biv_poisson_logpmf_fast(h, a, l1, l2, lam3)
+        prob = math.exp(lp)
+        
+        # Dixon-Coles 調整
+        if h == 0 and a == 0: prob *= (1 - lh * la * rho)
+        elif h == 0 and a == 1: prob *= (1 + lh * rho)
+        elif h == 1 and a == 0: prob *= (1 + la * rho)
+        elif h == 1 and a == 1: prob *= (1 - rho)
+        
+        # 累加負對數似然
+        if prob > 1e-9:
+            nll -= math.log(prob)
+        else:
+            nll -= math.log(1e-9)
+            
+    return nll
+
 def get_true_implied_prob(odds_dict: Dict[str, float]) -> Dict[str, float]:
     inv = {k: 1.0 / float(v) if v > 0 else 0.0 for k, v in odds_dict.items()}
     margin = sum(inv.values())
@@ -97,12 +134,14 @@ def get_matrix_cached(lh: float, la: float, max_g: int, nb_alpha: float) -> np.n
     return M / M.sum()
 
 # =========================
-# 2. 全景記憶體系 (Fixed: Added 'bets' key)
+# 2. 全景記憶體系 (V38.3 Data Decoupling)
 # =========================
 class RegimeMemory:
-    def __init__(self):
-        # [FIXED] 補上 'bets' 欄位，解決 KeyError
-        self.history_db = {
+    def __init__(self, db_path="regime_db.json"):
+        self.db_path = db_path
+        
+        # 內建預設值 (作為備份)
+        self.default_db = {
             "Bore_Draw_Stalemate": { "name": "🛡️ 雙重鐵桶", "roi": 0.219, "bets": 2150 }, 
             "Relegation_Dog": { "name": "🐕 保級受讓", "roi": 0.083, "bets": 1840 },
             "Fallen_Giant": { "name": "📉 豪門崩盤", "roi": -0.008, "bets": 920 },
@@ -111,6 +150,19 @@ class RegimeMemory:
             "MarketHype_Fav": { "name": "🔥 大熱倒灶", "roi": -0.080, "bets": 1560 },
             "MidTable_Standard": { "name": "😐 中游例行", "roi": 0.000, "bets": 5000 }
         }
+        
+        # [V38.3] 嘗試從 JSON 載入，實現數據解耦
+        self.history_db = self.load_db()
+
+    def load_db(self) -> Dict:
+        if os.path.exists(self.db_path):
+            try:
+                with open(self.db_path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except Exception as e:
+                print(f"Error loading DB, using default: {e}")
+                return self.default_db
+        return self.default_db
 
     def analyze_scenario(self, lh: float, la: float, odds: Dict) -> str:
         home_odd = odds.get("home", 2.0)
@@ -131,7 +183,7 @@ class RegimeMemory:
 # 3. 分析引擎邏輯
 # =========================
 class SniperAnalystLogic:
-    def __init__(self, json_data: Any, max_g: int = 9, nb_alpha: float = 0.12, lam3: float = 0.0, rho: float = -0.13):
+    def __init__(self, json_data: Any, max_g: int = 9, nb_alpha: float = 0.12, lam3: float = 0.0, rho: float = -0.13, home_adv_weight: float = 1.15):
         self.data = json_data if isinstance(json_data, dict) else json.loads(json_data)
         self.h = self.data["home"]
         self.a = self.data["away"]
@@ -140,9 +192,11 @@ class SniperAnalystLogic:
         self.nb_alpha = nb_alpha
         self.lam3 = lam3 
         self.rho = rho 
+        self.home_adv_weight = home_adv_weight
         self.memory = RegimeMemory()
 
     def calc_lambda(self) -> Tuple[float, float, bool]:
+        """計算 Lambda"""
         league_base = 1.35
         is_weighted = False
         def att_def_w(team):
@@ -161,9 +215,10 @@ class SniperAnalystLogic:
         strength_gap = (lh_att - la_att)
         crush_factor = 1.05 if strength_gap > 0.5 else 1.0
         
+        h_adv = self.home_adv_weight 
+        
         if self.h["context_modifiers"].get("missing_key_defender"): lh_def *= 1.25
         if self.a["context_modifiers"].get("missing_key_defender"): la_def *= 1.20
-        h_adv = self.h["general_strength"].get("home_advantage_weight", 1.15)
         
         return (lh_att * la_def / league_base) * h_adv * crush_factor, \
                (la_att * lh_def / league_base), is_weighted
@@ -261,22 +316,19 @@ class SniperAnalystLogic:
         return np.percentile(evs, 5), np.percentile(evs, 95)
 
     def run_monte_carlo_vectorized(self, M: np.ndarray, sims: int = 500000) -> Tuple[float, float, float, np.ndarray, np.ndarray]:
+        """[V38] 向量化蒙地卡羅"""
         rng = np.random.default_rng()
         flat_probs = M.flatten()
         flat_probs /= flat_probs.sum()
-        
         cdf = np.cumsum(flat_probs)
         draws = rng.random(sims)
         indices = np.searchsorted(cdf, draws)
-        
         G = M.shape[0]
         home_goals = indices // G
         away_goals = indices % G
-        
         h_wins = np.sum(home_goals > away_goals) / sims
         draws = np.sum(home_goals == away_goals) / sims
         a_wins = np.sum(home_goals < away_goals) / sims
-        
         return h_wins, draws, a_wins, home_goals, away_goals
 
     def run_ce_importance_sampling(self, M: np.ndarray, line: float, n_sims: int = 20000, n_elite: int = 1000) -> Dict[str, Any]:
@@ -306,7 +358,7 @@ class SniperAnalystLogic:
         return {"est": float(est)}
 
 # =========================
-# 4. Kalman Filter & MLE
+# 4. Kalman Filter & MLE (V38.3 Vectorized)
 # =========================
 class SimpleKalmanFilter:
     def __init__(self, initial_rating=1.0, process_noise=0.05, measure_noise=1.0):
@@ -345,33 +397,49 @@ def run_kalman_tracking(df):
     return pd.DataFrame(history), ratings
 
 def fit_params_mle(history_df: pd.DataFrame) -> Dict[str, float]:
+    """[V38.3] 向量化三維參數擬合 (使用 compute_batch_nll)"""
+    
+    # 準備 NumPy Arrays (轉為 Float64 以確保精度)
+    try:
+        lh_arr = history_df['lh_pred'].values.astype(np.float64)
+        la_arr = history_df['la_pred'].values.astype(np.float64)
+        h_arr = history_df['home_goals'].values.astype(np.int32)
+        a_arr = history_df['away_goals'].values.astype(np.int32)
+    except KeyError as e:
+        st.error(f"資料欄位缺失: {e}")
+        return {"success": False}
+
     def neg_log_likelihood(params):
-        lam3, rho = params
-        nll = 0.0
-        if not (0 <= lam3 <= 0.5) or not (-0.2 <= rho <= 0.2): return 1e9
-        for _, row in history_df.iterrows():
-            try:
-                lh, la = float(row['lh_pred']), float(row['la_pred'])
-                h, a = int(row['home_goals']), int(row['away_goals'])
-                l1 = max(0.01, lh - lam3)
-                l2 = max(0.01, la - lam3)
-                lp = biv_poisson_logpmf_fast(h, a, l1, l2, lam3)
-                prob = math.exp(lp)
-                if h==0 and a==0: prob *= (1 - lh*la*rho)
-                elif h==0 and a==1: prob *= (1 + lh*rho)
-                elif h==1 and a==0: prob *= (1 + la*rho)
-                elif h==1 and a==1: prob *= (1 - rho)
-                nll -= math.log(max(prob, 1e-9))
-            except: continue
+        lam3, rho, home_adv = params
+        
+        # 參數邊界懲罰 (Soft constraints)
+        penalty = 0.0
+        if not (0 <= lam3 <= 0.5): penalty += 1e6
+        if not (-0.3 <= rho <= 0.3): penalty += 1e6
+        if not (0.8 <= home_adv <= 1.6): penalty += 1e6
+        
+        if penalty > 0: return penalty
+        
+        # 呼叫 Numba 加速的計算核心
+        nll = compute_batch_nll(lh_arr, la_arr, h_arr, a_arr, lam3, rho, home_adv)
         return nll
-    initial_guess = [0.1, -0.1]
+
+    # 初始猜測
+    initial_guess = [0.1, -0.1, 1.15]
+    # 使用 Nelder-Mead (不需要梯度，適合這類問題)
     result = minimize(neg_log_likelihood, initial_guess, method='Nelder-Mead', tol=1e-3)
-    return {"lam3": result.x[0], "rho": result.x[1], "success": result.success}
+    
+    return {
+        "lam3": result.x[0], 
+        "rho": result.x[1], 
+        "home_adv": result.x[2],
+        "success": result.success
+    }
 
 # =========================
-# 5. Streamlit UI (V38.1 BugFix)
+# 5. Streamlit UI (V38.3 Evolution)
 # =========================
-st.set_page_config(page_title="Sniper V38.1", page_icon="🧿", layout="wide")
+st.set_page_config(page_title="Sniper V38.3", page_icon="🧿", layout="wide")
 
 st.markdown("""
 <style>
@@ -381,8 +449,8 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 with st.sidebar:
-    st.title("🧿 Sniper V38.1")
-    st.caption("Trinity + BugFix")
+    st.title("🧿 Sniper V38.3")
+    st.caption("Evolution Edition (Decoupled+Vectorized)")
     if HAS_NUMBA:
         st.success("⚡ Numba 加速引擎：已啟動")
     else:
@@ -391,14 +459,19 @@ with st.sidebar:
     st.markdown("---")
     app_mode = st.radio("功能模式：", ["🎯 單場深度預測", "🛡️ 風險對沖實驗室", "🔧 參數校正實驗室", "📈 聯賽歷史回測", "📚 劇本查詢"])
     st.divider()
-    with st.expander("🛠️ 進階參數", expanded=False):
+    with st.expander("🛠️ 進階參數 (可參考校正結果)", expanded=False):
         unit_stake = st.number_input("單注本金 ($)", 10, 10000, 100)
         nb_alpha = st.slider("Alpha (NB)", 0.05, 0.25, 0.12)
         use_biv = st.toggle("啟用 Bivariate Poisson", value=True)
         use_dc = st.toggle("啟用 Dixon-Coles", value=True)
+        
+        st.markdown("---")
+        st.caption("👇 請輸入校正實驗室算出的參數")
         c1, c2 = st.columns(2)
         lam3_input = c1.number_input("Lambda 3", 0.0, 0.5, 0.15, step=0.01)
         rho_input = c2.number_input("Rho (DC)", -0.3, 0.3, -0.13, step=0.01)
+        home_adv_input = st.number_input("主場優勢 (Home Adv)", 0.8, 1.6, 1.15, step=0.01)
+        
         risk_scale = st.slider("風險係數", 0.1, 1.0, 0.3)
         use_mock_memory = st.checkbox("歷史記憶修正", value=True)
         show_uncertainty = st.toggle("顯示 EV 不確定區間", value=True)
@@ -420,7 +493,7 @@ if app_mode == "🎯 單場深度預測":
 
     if st.button("🚀 執行極速分析", type="primary"):
         if input_data:
-            engine = SniperAnalystLogic(input_data, 9, nb_alpha, lam3_input, rho_input)
+            engine = SniperAnalystLogic(input_data, 9, nb_alpha, lam3_input, rho_input, home_adv_input)
             lh, la, is_weighted = engine.calc_lambda()
             M, probs_detail = engine.build_matrix_v38(lh, la, use_biv=use_biv, use_dc=use_dc)
             market_bonus = engine.get_market_trend_bonus()
@@ -692,15 +765,15 @@ elif app_mode == "🛡️ 風險對沖實驗室":
             st.warning("⚠️ 請先在「單場深度預測」執行分析，以生成模擬數據。")
 
 # =========================
-# 模式 3: 參數校正實驗室 (V37.8 Force Multi)
+# 模式 3: 參數校正實驗室 (V38.3 Multi-Source + Vectorized)
 # =========================
 elif app_mode == "🔧 參數校正實驗室":
-    st.header("🔧 參數校正實驗室 (Auto-Calibration)")
-    st.markdown("利用 `scipy.optimize` 尋找歷史數據中的最佳 Lambda3 (共變異) 與 Rho (DC校正)")
+    st.header("🔧 參數校正實驗室 (Calibration & Tracking)")
+    st.markdown("功能：自動尋找最佳參數，或使用 Kalman Filter 追蹤球隊實力。")
     
     # [V37.8] 強制多選修復：加入 key="uploader_v37_8"
     cal_files = st.file_uploader(
-        "上傳含有 lh_pred, la_pred, home_goals, away_goals 的 CSV 或 Excel (可多選)", 
+        "上傳歷史數據 (CSV/Excel) (可多選)", 
         type=['csv', 'xlsx'], 
         accept_multiple_files=True,
         key="uploader_v37_8" 
@@ -710,6 +783,7 @@ elif app_mode == "🔧 參數校正實驗室":
         all_dfs = []
         for file in cal_files:
             try:
+                # 萬用讀取邏輯
                 filename = file.name.lower()
                 if filename.endswith('.csv'):
                     try:
@@ -736,13 +810,16 @@ elif app_mode == "🔧 參數校正實驗室":
                 c1, c2 = st.columns(2)
                 
                 with c1:
-                    if st.button("⚡ 開始 MLE 靜態參數擬合"):
+                    if st.button("⚡ 開始 MLE 參數擬合"):
                         with st.spinner("正在進行最大概似估計 (MLE)..."):
+                            # [V38.2] 傳回三個參數 (已修正為 Vectorized Numba Version)
                             best_params = fit_params_mle(df_cal)
                         if best_params["success"]:
-                            st.success("校正成功！建議參數：")
-                            st.metric("最佳 Lambda3", f"{best_params['lam3']:.3f}")
-                            st.metric("最佳 Rho (DC)", f"{best_params['rho']:.3f}")
+                            st.success("校正成功！請將以下參數填入側邊欄：")
+                            c_p1, c_p2, c_p3 = st.columns(3)
+                            c_p1.metric("最佳 Lambda3", f"{best_params['lam3']:.3f}")
+                            c_p2.metric("最佳 Rho (DC)", f"{best_params['rho']:.3f}")
+                            c_p3.metric("主場優勢 (Home Adv)", f"{best_params['home_adv']:.3f}")
                         else:
                             st.error("校正收斂失敗。")
                             
@@ -776,7 +853,7 @@ elif app_mode == "🔧 參數校正實驗室":
 # =========================
 elif app_mode == "📈 聯賽歷史回測":
     st.title("📈 聯賽歷史回測")
-    st.info("請將 CSV 檔案放入資料夾後，使用 V37 Batch Engine 進行測試。")
+    st.info("請將 CSV 檔案放入資料夾後，使用 V38 Batch Engine 進行測試。")
 
 elif app_mode == "📚 劇本查詢":
     st.title("📚 盤口劇本庫")
