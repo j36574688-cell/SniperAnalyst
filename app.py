@@ -12,7 +12,7 @@ from functools import lru_cache
 from scipy.special import logsumexp, gammaln
 from scipy.optimize import minimize
 
-# [V40.5] 安全導入 Plotly
+# [V40.6] 安全導入 Plotly
 try:
     import plotly.express as px
     import plotly.graph_objects as go
@@ -32,7 +32,7 @@ except ImportError:
     def prange(n): return range(n)
 
 # =========================
-# 1. 核心數學工具
+# 1. 核心數學工具 (Kernel)
 # =========================
 EPS = 1e-15
 
@@ -184,6 +184,7 @@ class PaperTradingSystem:
         return True
     
     def save_bets(self, df):
+        # 自動重新計算 PnL
         for idx, row in df.iterrows():
             res = row['Result']
             stake = float(row['Stake'])
@@ -197,7 +198,10 @@ class PaperTradingSystem:
     def get_stats(self):
         df = self.load_bets()
         if df.empty: return 0, 0, 0
-        return len(df), df["Stake"].sum(), df["PnL"].sum()
+        total_bets = len(df)
+        total_stake = df["Stake"].sum()
+        total_pnl = df["PnL"].sum()
+        return total_bets, total_stake, total_pnl
 
 # =========================
 # 3. 分析引擎邏輯
@@ -224,7 +228,6 @@ class SniperAnalystLogic:
 
         lh_att, lh_def = att_def_w(self.h)
         la_att, la_def = att_def_w(self.a)
-        
         strength_gap = (lh_att - la_att)
         crush_factor = 1.05 if strength_gap > 0.5 else 1.0
         
@@ -286,17 +289,10 @@ class SniperAnalystLogic:
         return bonus
 
     def ah_ev(self, M, hcap, odds):
-        # Recursive calculation for asian handicap (0.25, 0.75 etc)
         q = int(round(hcap * 4))
-        if q % 2 != 0: 
-            return 0.5 * self.ah_ev(M, (q+1)/4.0, odds) + 0.5 * self.ah_ev(M, (q-1)/4.0, odds)
-        
+        if q % 2 != 0: return 0.5 * self.ah_ev(M, (q+1)/4.0, odds) + 0.5 * self.ah_ev(M, (q-1)/4.0, odds)
         idx_diff = np.subtract.outer(np.arange(self.max_g), np.arange(self.max_g)) 
-        # For Hcap +0.5: Home Wins or Draw. Hcap -0.5: Home Wins.
-        # hcap is added to Home goals.
-        # r_matrix > 0 means Home wins with hcap.
-        r_matrix = idx_diff + hcap
-        payoff = np.select([r_matrix > 0.001, np.abs(r_matrix) <= 0.001, r_matrix < -0.001], [odds - 1, 0, -1], default=-1)
+        payoff = np.select([idx_diff + hcap > 0.001, np.abs(idx_diff + hcap) <= 0.001], [odds-1, 0], default=-1)
         return np.sum(M * payoff) * 100
 
     def check_sensitivity(self, lh, la):
@@ -346,7 +342,7 @@ class SniperAnalystLogic:
         return {"est": float(est)}
 
 # =========================
-# 4. 資料處理工具
+# 4. 資料處理工具 (V40.3 強力讀取版)
 # =========================
 def preprocess_uploaded_data(df: pd.DataFrame) -> pd.DataFrame:
     df.columns = [str(c).strip() for c in df.columns]
@@ -459,9 +455,9 @@ def plot_calendar_heatmap(df_bets):
     return fig
 
 # =========================
-# 5. UI (V40.5 The Missing Piece)
+# 5. UI (V40.6 Grand Fix)
 # =========================
-st.set_page_config(page_title="Sniper V40.5", page_icon="🧿", layout="wide")
+st.set_page_config(page_title="Sniper V40.6", page_icon="🧿", layout="wide")
 st.markdown("<style>.metric-box { background-color: #f0f2f6; padding: 10px; border-radius: 8px; text-align: center; } .stProgress > div > div > div > div { background-color: #4CAF50; }</style>", unsafe_allow_html=True)
 
 # 初始化
@@ -469,8 +465,8 @@ ptrader = PaperTradingSystem()
 if "cart" not in st.session_state: st.session_state.cart = []
 
 with st.sidebar:
-    st.title("🧿 Sniper V40.5")
-    st.caption("Complete Restoration")
+    st.title("🧿 Sniper V40.6")
+    st.caption("Grand Fix Edition")
     if HAS_NUMBA: st.success("⚡ Numba 加速：已啟動")
     else: st.warning("⚠️ Numba 加速：未啟動")
     
@@ -571,62 +567,49 @@ if app_mode == "🎯 單場深度預測":
                 var, sharpe = calc_risk_metrics(p, o)
                 kelly = calc_risk_adj_kelly(adj_ev, var, risk_scale, p)
                 amt = unit_stake * (kelly/100.0)
-                
-                # [V40.5] 1x2 row construction
-                r_1x2.append({
-                    "選項": tag, "賠率": o, 
-                    "真實機率": f"{p:.1%}", 
-                    "EV": f"{adj_ev:.1f}%", 
-                    "Kelly": f"{kelly:.1f}%",
-                    "建議金額": f"${amt:.0f}"
-                })
+                r_1x2.append({"選項": tag, "賠率": o, "機率": f"{p:.1%}", "期望值": f"{adj_ev:.1f}%", "凱利建議": f"{kelly:.1f}%", "建議金額": f"${amt:.0f}"})
                 if adj_ev > 0.2: 
                     candidates.append({"pick": tag, "odds": o, "ev": adj_ev, "kelly": kelly, "type": "1x2", "prob": p, "sharpe": sharpe})
             st.dataframe(pd.DataFrame(r_1x2), use_container_width=True)
             
-            # [V40.5] 修復：加回亞盤與大小球
+            # [V40.6] 亞盤優化 - 顯示「誰讓分」
             c_ah, c_ou = st.columns(2)
             with c_ah:
                 st.subheader("亞盤 (AH)")
                 rows_ah = []
-                target_o = eng.market.get("target_odds", 1.90)
-                # 使用預設盤口或從 JSON 讀取
-                handicaps = eng.market.get("handicaps", [-0.5, 0.5])
-                for hcap in handicaps:
-                    raw_ev = eng.ah_ev(M, hcap, target_o) + res["bonus"]["home"]
-                    adj_ev = raw_ev * res["conf"]
-                    # 估算過盤率
-                    p_approx = (raw_ev/100.0 + 1) / target_o
-                    var, sharpe = calc_risk_metrics(p_approx, target_o)
-                    kel = calc_risk_adj_kelly(adj_ev, var, risk_scale, p_approx)
+                target = eng.market.get("target_odds", 1.90)
+                for hcap in eng.market.get("handicaps", [-0.5, 0.5]):
+                    raw = eng.ah_ev(M, hcap, target) + res["bonus"]["home"]
+                    adj = raw * res["conf"]
+                    p_approx = (raw/100+1)/target
+                    var, sharpe = calc_risk_metrics(p_approx, target)
+                    kel = calc_risk_adj_kelly(adj, var, risk_scale, p_approx)
                     amt = unit_stake * (kel/100.0)
-                    rows_ah.append({
-                        "盤口": f"{hcap:+}", "賠率": target_o, 
-                        "EV": f"{adj_ev:.1f}%", "Kelly": f"{kel:.1f}%"
-                    })
-                    if adj_ev > 0.5:
-                        candidates.append({"pick":f"AH {hcap:+}", "odds":target_o, "ev":adj_ev, "kelly":kel, "type":"AH", "prob": p_approx, "sharpe": sharpe})
+                    
+                    # 判斷讓分方
+                    if hcap < 0: tag_str = f"主讓 {hcap}"
+                    elif hcap > 0: tag_str = f"主受 +{hcap}"
+                    else: tag_str = "平手盤"
+                    
+                    rows_ah.append({"盤口": tag_str, "機率": f"{p_approx:.1%}", "期望值": f"{adj:.1f}%", "凱利": f"{kel:.1f}%", "金額": f"${amt:.0f}"})
+                    if adj > 0.5: candidates.append({"pick": tag_str, "odds": target, "ev": adj, "kelly": kel, "type": "AH", "prob": p_approx, "sharpe": sharpe})
                 st.dataframe(pd.DataFrame(rows_ah), use_container_width=True)
-
+            
             with c_ou:
                 st.subheader("大小 (OU)")
                 rows_ou = []
-                goal_lines = eng.market.get("goal_lines", [2.5])
                 idx_sum = np.add.outer(np.arange(eng.max_g), np.arange(eng.max_g))
-                for line in goal_lines:
+                for line in eng.market.get("goal_lines", [2.5]):
                     p_over = float(M[idx_sum > line].sum())
-                    raw_ev = (p_over * target_o - 1) * 100
-                    adj_ev = raw_ev * res["conf"]
-                    var, sharpe = calc_risk_metrics(p_over, target_o)
-                    kel = calc_risk_adj_kelly(adj_ev, var, risk_scale, p_over)
-                    rows_ou.append({
-                        "盤口": f"Over {line}", "賠率": target_o,
-                        "EV": f"{adj_ev:.1f}%", "Kelly": f"{kel:.1f}%"
-                    })
-                    if adj_ev > 0.5:
-                        candidates.append({"pick":f"Over {line}", "odds":target_o, "ev":adj_ev, "kelly":kel, "type":"OU", "prob": p_over, "sharpe": sharpe})
+                    raw = (p_over*target - 1)*100
+                    adj = raw * res["conf"]
+                    var, sharpe = calc_risk_metrics(p_over, target)
+                    kel = calc_risk_adj_kelly(adj, var, risk_scale, p_over)
+                    amt = unit_stake * (kel/100.0)
+                    rows_ou.append({"盤口": f"大 {line}", "機率": f"{p_over:.1%}", "期望值": f"{adj:.1f}%", "凱利": f"{kel:.1f}%", "金額": f"${amt:.0f}"})
+                    if adj > 0.5: candidates.append({"pick":f"大 {line}", "odds":target, "ev":adj, "kelly":kel, "type":"OU", "prob": p_over, "sharpe": sharpe})
                 st.dataframe(pd.DataFrame(rows_ou), use_container_width=True)
-
+                
             st.divider()
             st.markdown("### 🏆 智能投資組合")
             if candidates:
@@ -634,34 +617,22 @@ if app_mode == "🎯 單場深度預測":
                 reco = []
                 for p in best:
                     amt = unit_stake * (p['kelly']/100)
-                    reco.append({"選項": f"[{p['type']}] {p['pick']}", "賠率": p['odds'], "EV": f"{p['ev']:+.1f}%", "Kelly": f"{p['kelly']:.1f}%", "建議": f"${amt:.1f}"})
+                    reco.append({"選項": f"[{p['type']}] {p['pick']}", "賠率": p['odds'], "期望值": f"{p['ev']:+.1f}%", "凱利%": f"{p['kelly']:.1f}%", "建議$": f"${amt:.1f}"})
                 st.dataframe(pd.DataFrame(reco), use_container_width=True)
                 
-                # [V40.5] 修復：加回智能評語 (Verdict)
-                top_pick = best[0]
-                total_ret = sum([p['ev'] * (p['kelly']/100) for p in best])
-                v_color = "green" if total_ret > 1.0 else "orange" if total_ret > 0.2 else "red"
-                v_text = ""
-                if total_ret < 0.2: v_text = "風險回報過低，建議觀望。"
-                elif best[0]['kelly'] > 5.0: v_text = f"強烈看好 **{top_pick['pick']}**，建議單注重擊。"
-                else: v_text = "建議分散資金進行對沖配置。"
-                
-                st.markdown(f"""<div style='background:#f0f2f6;padding:10px;color:black;border-left:5px solid {v_color}'>
-                <b>👨‍🏫 首席分析師評語:</b> {v_text} (組合 EV: {total_ret:.2f}%)</div>""", unsafe_allow_html=True)
-
                 c_cart1, c_cart2 = st.columns([3, 1])
                 bet_pick = c_cart1.selectbox("加入購物車", [f"[{p['type']}] {p['pick']}" for p in best])
                 if c_cart2.button("➕"):
                     sel = next(p for p in best if f"[{p['type']}] {p['pick']}" == bet_pick)
                     amt = unit_stake * (sel['kelly']/100)
                     st.session_state.cart.append({"sel": bet_pick, "odds": sel['odds'], "stake": amt})
-                    st.success("Added")
+                    st.success("已加入")
                     st.rerun()
             else: st.info("無推薦注單")
 
         with t_ai:
             st.write("權重分析")
-            st.dataframe(pd.DataFrame([probs["model"], probs["market"], probs["hybrid"]], index=["Model","Market","Hybrid"]))
+            st.dataframe(pd.DataFrame([probs["model"], probs["market"], probs["hybrid"]], index=["純模型","市場隱含","混合權重"]))
 
         with t_vis:
             st.subheader("🌈 視覺洞察")
@@ -670,22 +641,13 @@ if app_mode == "🎯 單場深度預測":
                 st.divider()
                 c_v1, c_v2 = st.columns(2)
                 with c_v1: st.plotly_chart(plot_score_heatmap(M), use_container_width=True)
-                with c_v2: st.plotly_chart(px.histogram(x=res["sh"], nbins=10, title="主隊進球分布"), use_container_width=True)
+                with c_v2: st.plotly_chart(px.histogram(x=res["sh"], nbins=10, title="主隊進球"), use_container_width=True)
                 st.plotly_chart(plot_sensitivity_surface(res['lh'], res['la'], lam3_in, rho_in, 9), use_container_width=True)
             else: st.warning("請安裝 Plotly")
 
         with t_sim:
             hw = np.sum(res["sh"] > res["sa"]) / 500000
             st.metric("MC 主勝", f"{hw:.1%}")
-            
-            # [V40.5] 修復：加回極速模擬圖表 (Matplotlib version as fallback/simple view)
-            fig, ax = plt.subplots(figsize=(6,2))
-            ax.hist(res["sh"], alpha=0.5, label="Home", bins=range(8), density=True)
-            ax.hist(res["sa"], alpha=0.5, label="Away", bins=range(8), density=True)
-            ax.legend()
-            st.pyplot(fig)
-            
-            st.divider()
             ce_res = eng.run_ce_importance_sampling(M, 4.5)
             st.metric("大 4.5 機率", f"{ce_res['est']:.2%}")
 
@@ -715,31 +677,33 @@ if app_mode == "🎯 單場深度預測":
             c_r2.metric("新 EV", f"{nev:.1f}%", delta_color="normal" if nev>0 else "inverse")
 
 elif app_mode == "🛡️ 風險對沖實驗室":
-    st.title("🛡️ 風險對沖")
-    tab_arb, tab_lay, tab_port = st.tabs(["⚡ 套利", "📉 Lay", "📊 組合"])
+    st.title("🛡️ 風險對沖實驗室")
+    # [V40.6] 恢復完整功能與中文化
+    tab_arb, tab_lay, tab_port = st.tabs(["⚡ 1x2 套利", "📉 交易所對沖", "📊 智能組合優化"])
+    
     with tab_arb:
         c1, c2, c3 = st.columns(3)
-        o1 = c1.number_input("主", 2.0); o2 = c2.number_input("和", 3.0); o3 = c3.number_input("客", 4.0)
+        o1 = c1.number_input("主勝賠率", 2.0); o2 = c2.number_input("和局賠率", 3.0); o3 = c3.number_input("客勝賠率", 4.0)
         inv = 1/o1+1/o2+1/o3
-        if inv<1: st.success(f"套利! {1/inv-1:.1%}")
-        else: st.info("無套利")
+        if inv<1: st.success(f"發現套利機會! ROI: {1/inv-1:.1%}")
+        else: st.info(f"無套利空間 (Book: {inv:.2%})")
 
     with tab_lay:
         c1, c2 = st.columns(2)
-        b_o = c1.number_input("Back Odds", 1.01, 10.0, 2.5)
-        stake = c1.number_input("Stake", 10, 1000, 100)
-        l_o = c2.number_input("Lay Odds", 1.01, 10.0, 2.6)
-        comm = c2.number_input("Comm %", 0.0, 5.0, 2.0)/100
+        b_o = c1.number_input("Back 賠率", 1.01, 10.0, 2.5)
+        stake = c1.number_input("Back 本金", 10, 1000, 100)
+        l_o = c2.number_input("Lay 賠率", 1.01, 10.0, 2.6)
+        comm = c2.number_input("佣金 %", 0.0, 5.0, 2.0)/100
         if l_o>1:
             lay_s = (stake*b_o)/(l_o-comm)
-            st.metric("Lay Amount", f"${lay_s:.2f}")
+            st.metric("建議 Lay 金額", f"${lay_s:.2f}")
 
     with tab_port:
         if st.session_state.get("analysis_results"):
             res = st.session_state.analysis_results
             sh, sa = res["sh"], res["sa"]
             eng = res["eng"]
-            if st.button("⚡ 計算"):
+            if st.button("⚡ 計算最佳配置"):
                 cands = [{"name":"主勝","odds":eng.market["1x2_odds"]["home"],"cond":sh>sa}, {"name":"和局","odds":eng.market["1x2_odds"]["draw"],"cond":sh==sa}, {"name":"大2.5","odds":1.9,"cond":(sh+sa)>2.5}]
                 pay = np.zeros((500000,3))
                 for i,c in enumerate(cands): pay[:,i] = np.where(c["cond"], c["odds"]-1, -1)
@@ -747,60 +711,34 @@ elif app_mode == "🛡️ 風險對沖實驗室":
                 cons = ({'type':'eq','fun':lambda w: sum(w)-1})
                 opt = minimize(lambda w: -(np.dot(w,mu)-np.dot(w.T,np.dot(sigma,w))), [0.33]*3, bounds=[(0,1)]*3, constraints=cons)
                 for i,w in enumerate(opt.x): st.metric(cands[i]["name"], f"{w:.1%}")
-        else: st.warning("需先執行預測")
+                
+                ret = np.dot(opt.x, mu)*100
+                st.markdown(f"""<div style='background:#f0f2f6;padding:10px;color:black'>
+                <b>首席分析師:</b> 預期回報 {ret:.2f}%。建議 {"分散配置以降低波動" if max(opt.x)<0.7 else "集中單打高價值選項"}。</div>""", unsafe_allow_html=True)
+        else: st.warning("請先執行單場預測")
 
 elif app_mode == "🔧 參數校正實驗室":
-    st.header("🔧 參數校正 (V40.3 強力讀取)")
-    files = st.file_uploader("上傳 CSV/Excel (支援 Big5/Latin-1)", accept_multiple_files=True)
+    st.header("🔧 參數校正")
+    files = st.file_uploader("上傳 CSV/Excel", type=['csv','xlsx'], accept_multiple_files=True)
     if files:
-        dfs = []
-        for f in files:
-            try:
-                if f.name.endswith('.csv'):
-                    try:
-                        df = pd.read_csv(f, encoding='utf-8')
-                    except UnicodeDecodeError:
-                        f.seek(0)
-                        try:
-                            df = pd.read_csv(f, encoding='big5')
-                        except UnicodeDecodeError:
-                            f.seek(0)
-                            df = pd.read_csv(f, encoding='latin-1')
-                else:
-                    df = pd.read_excel(f)
-                df = preprocess_uploaded_data(df)
-                if not df.empty: dfs.append(df)
-            except Exception as e:
-                st.warning(f"檔案 {f.name} 讀取失敗: {e}")
-        
-        if dfs:
-            full = pd.concat(dfs, ignore_index=True)
-            st.write(f"成功合併 {len(full)} 筆數據", full.head(3))
-            
-            c1, c2 = st.columns(2)
-            with c1:
-                if st.button("⚡ MLE"):
-                    r = fit_params_mle(full)
-                    if r["success"]:
-                        st.success(f"Lam3={r['lam3']:.2f}, Rho={r['rho']:.2f}, HA={r['home_adv']:.2f}")
-                    else: st.error("校正失敗")
-            with c2:
-                if st.button("📈 Kalman"):
-                    h, _ = run_kalman_tracking(full)
-                    st.dataframe(h.tail())
-        else: st.error("無有效數據")
+        dfs = [preprocess_uploaded_data(pd.read_csv(f) if f.name.endswith('.csv') else pd.read_excel(f)) for f in files]
+        full = pd.concat([d for d in dfs if not d.empty])
+        if st.button("⚡ MLE"):
+            r = fit_params_mle(full)
+            if r["success"]: st.success(f"Lam3={r['lam3']:.2f}, Rho={r['rho']:.2f}, HA={r['home_adv']:.2f}")
 
-# [MODE 4: 實戰績效回顧 (Settlement Upgrade)]
+# [MODE 4: 實戰績效回顧 (Fixed Crash)]
 elif app_mode == "📈 實戰績效回顧":
     st.title("📈 實戰績效回顧")
     df = ptrader.load_bets()
     
     if not df.empty:
         st.markdown("### 📝 注單管理 (直接點擊表格修改)")
+        # [V40.6 Fix] Corrected SelectboxColumn
         edited_df = st.data_editor(
             df,
             column_config={
-                "Result": st.column_config.SelectColumn(
+                "Result": st.column_config.SelectboxColumn(
                     "比賽結果",
                     width="medium",
                     options=["Pending", "Win", "Lose", "Void"],
@@ -832,4 +770,4 @@ elif app_mode == "📈 實戰績效回顧":
         st.info("尚無模擬注單。請在「單場深度預測」中加入注單。")
 
 elif app_mode == "📚 劇本查詢":
-    st.dataframe(pd.DataFrame([{"N":v["name"],"R":v["roi"]} for k,v in RegimeMemory().history_db.items()]))
+    st.dataframe(pd.DataFrame([{"Name":v["name"],"ROI":v["roi"]} for k,v in RegimeMemory().history_db.items()]))
