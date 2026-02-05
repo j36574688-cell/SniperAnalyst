@@ -11,7 +11,7 @@ from functools import lru_cache
 from scipy.special import logsumexp, gammaln
 from scipy.optimize import minimize
 
-# [V38] 嘗試導入 Numba
+# [V38] 嘗試導入 Numba 進行 JIT 加速
 try:
     from numba import njit, prange
     HAS_NUMBA = True
@@ -23,7 +23,7 @@ except ImportError:
     def prange(n): return range(n)
 
 # =========================
-# 1. 核心數學工具 (V38.4 Auto-Kernel)
+# 1. 核心數學工具 (V38.5 Kernel)
 # =========================
 EPS = 1e-15
 
@@ -85,9 +85,10 @@ def get_true_implied_prob(odds_dict):
     s = sum(inv.values())
     return {k: inv[k]/s if s>0 else 0.0 for k in odds_dict}
 
-def calc_risk_adj_kelly(ev_p, var, risk_scale=0.5, prob=0.5):
-    if var<=0 or ev_p<=0: return 0.0
-    f = (ev_p/100.0 / var) * risk_scale
+def calc_risk_adj_kelly(ev_percent, variance, risk_scale=0.5, prob=0.5):
+    if variance<=0 or ev_percent<=0: return 0.0
+    ev = ev_percent/100.0
+    f = (ev / variance) * risk_scale
     cap = 0.5 if prob>=0.35 else 0.025
     return min(cap, max(0.0, f)) * 100
 
@@ -98,6 +99,18 @@ def calc_risk_metrics(prob, odds):
     var = prob*(win_p**2) + (1-prob)*(lose_p**2) - (ev**2)
     sharpe = ev/math.sqrt(var) if var>0 else 0
     return var, sharpe
+
+@st.cache_data
+def get_matrix_cached(lh, la, max_g, nb_alpha):
+    # Fallback for sensitivity check
+    G = max_g
+    M = np.zeros((G, G))
+    for i in range(G):
+        for j in range(G):
+            # Simple Poisson for stress test
+            p = math.exp(biv_poisson_logpmf_fast(i, j, lh, la, 0.0))
+            M[i, j] = p
+    return M / M.sum()
 
 # =========================
 # 2. 全景記憶體系
@@ -139,7 +152,7 @@ class RegimeMemory:
         return 1.0
 
 # =========================
-# 3. 分析引擎邏輯
+# 3. 分析引擎邏輯 (V38.5 Restored Full Logic)
 # =========================
 class SniperAnalystLogic:
     def __init__(self, json_data, max_g=9, nb_alpha=0.12, lam3=0.0, rho=-0.13, home_adv=1.15):
@@ -153,14 +166,31 @@ class SniperAnalystLogic:
         self.memory = RegimeMemory()
 
     def calc_lambda(self):
-        w_att_def = lambda t: (t["offensive_stats"]["goals_scored_avg"]*0.3 + t["offensive_stats"].get("xg_avg",1.0)*0.7, t["defensive_stats"]["goals_conceded_avg"]*0.3 + t["defensive_stats"].get("xga_avg",1.0)*0.7)
-        lh_a, lh_d = w_att_def(self.h)
-        la_a, la_d = w_att_def(self.a)
-        base = 1.35
-        lh = (lh_a * la_d / base) * self.home_adv
-        la = (la_a * lh_d / base)
-        weighted = False # simplified
-        return lh, la, weighted
+        # [Restored Logic]
+        def att_def_w(team):
+            xg, xga = team["offensive_stats"].get("xg_avg", 1.0), team["defensive_stats"].get("xga_avg", 1.0)
+            trend = team["context_modifiers"].get("recent_form_trend", [0, 0, 0])
+            w = np.array([0.1, 0.3, 0.6])
+            form_factor = 1.0 + (np.dot(trend[-len(w):], w[-len(trend):]) * 0.1)
+            return (0.3 * team["offensive_stats"]["goals_scored_avg"] + 0.7 * xg) * form_factor, \
+                   (0.3 * team["defensive_stats"]["goals_conceded_avg"] + 0.7 * xga)
+
+        lh_att, lh_def = att_def_w(self.h)
+        la_att, la_def = att_def_w(self.a)
+        
+        strength_gap = (lh_att - la_att)
+        crush_factor = 1.05 if strength_gap > 0.5 else 1.0
+        
+        # Apply Home Adv
+        lh = (lh_att * la_def / 1.35) * self.home_adv * crush_factor
+        la = (la_att * lh_def / 1.35)
+        
+        if self.h["context_modifiers"].get("missing_key_defender"): lh *= 0.9 # logic changed? assume def affects other team score
+        # Previous logic: if home missing defender, AWAY score increases (la increases)
+        if self.h["context_modifiers"].get("missing_key_defender"): la *= 1.25
+        if self.a["context_modifiers"].get("missing_key_defender"): lh *= 1.20
+        
+        return lh, la, True
 
     def build_matrix_v38(self, lh, la, use_biv=True, use_dc=True):
         G = self.max_g
@@ -174,17 +204,20 @@ class SniperAnalystLogic:
         
         if use_dc:
             rho = self.rho
-            M[0,0] *= 1 - lh*la*rho
-            M[0,1] *= 1 + lh*rho
-            M[1,0] *= 1 + la*rho
-            M[1,1] *= 1 - rho
+            def tau(x, y):
+                if x==0 and y==0: return 1 - lh*la*rho
+                elif x==0 and y==1: return 1 + lh*rho
+                elif x==1 and y==0: return 1 + la*rho
+                elif x==1 and y==1: return 1 - rho
+                return 1.0
+            for i in range(2):
+                for j in range(2): M[i,j] *= tau(i,j)
             
         M /= M.sum()
         
         imp = get_true_implied_prob(self.market["1x2_odds"])
         ph, pd, pa = float(np.sum(np.tril(M,-1))), float(np.sum(np.diag(M))), float(np.sum(np.triu(M,1)))
         
-        # Hybrid
         w = 0.7 if abs(ph - imp["home"]) < 0.2 else 0.5
         th = w*ph + (1-w)*imp["home"]
         td = w*pd + (1-w)*imp["draw"]
@@ -199,21 +232,48 @@ class SniperAnalystLogic:
         return M_hybrid, {"model": {"home": ph, "draw": pd, "away": pa}, "market": imp, "hybrid": {"home": th, "draw": td, "away": ta}}
 
     def get_market_trend_bonus(self):
-        return {"home":0.0, "draw":0.0, "away":0.0} # simplified
+        # [Restored]
+        bonus = {"home":0.0, "draw":0.0, "away":0.0}
+        op, cu = self.market.get("opening_odds"), self.market.get("1x2_odds")
+        if not op or not cu: return bonus
+        for k in bonus:
+            drop = max(0.0, (op[k] - cu[k]) / op[k])
+            bonus[k] = min(3.0, drop * 30.0)
+        return bonus
 
     def ah_ev(self, M, hcap, odds):
+        # [Restored Recursive Logic for 0.25/0.75]
+        q = int(round(hcap * 4))
+        if q % 2 != 0: return 0.5 * self.ah_ev(M, (q+1)/4.0, odds) + 0.5 * self.ah_ev(M, (q-1)/4.0, odds)
+        
         idx_diff = np.subtract.outer(np.arange(self.max_g), np.arange(self.max_g)) 
         payoff = np.select([idx_diff + hcap > 0.001, np.abs(idx_diff + hcap) <= 0.001], [odds-1, 0], default=-1)
         return np.sum(M * payoff) * 100
 
     def check_sensitivity(self, lh, la):
-        return "Medium", 0.0 # simplified
+        # [Restored]
+        M_stress = get_matrix_cached(lh, la + 0.3, self.max_g, self.nb_alpha)
+        p_orig = float(np.sum(np.tril(get_matrix_cached(lh, la, self.max_g, self.nb_alpha), -1)))
+        p_new = float(np.sum(np.tril(M_stress, -1)))
+        drop = (p_orig - p_new) / p_orig if p_orig > 0 else 0
+        return ("High" if drop > 0.15 else "Medium"), drop
 
     def calc_model_confidence(self, lh, la, diff, sens):
-        return 1.0, [] # simplified
+        # [Restored]
+        score, reasons = 1.0, []
+        if diff > 0.25: score *= 0.7; reasons.append(f"與市場差異過大 ({diff:.1%})")
+        if sens > 0.15: score *= 0.8; reasons.append("模型對運氣球敏感")
+        if (lh + la) > 3.5: score *= 0.9; reasons.append("高變異風險 (xG > 3.5)")
+        return score, reasons
 
-    def simulate_uncertainty(self, lh, la, base):
-        return base*0.9, base*1.1
+    def simulate_uncertainty(self, lh, la, base_ev):
+        evs = []
+        for _ in range(50):
+            lh_s = lh * np.random.normal(1.0, 0.1)
+            la_s = la * np.random.normal(1.0, 0.1)
+            ratio = (lh_s - la_s) / (lh - la) if abs(lh - la) > 0.1 else 1.0
+            evs.append(base_ev * ratio)
+        return np.percentile(evs, 5), np.percentile(evs, 95)
 
     def run_monte_carlo_vectorized(self, M, sims=500000):
         rng = np.random.default_rng()
@@ -224,23 +284,30 @@ class SniperAnalystLogic:
         return np.sum(hg>ag)/sims, np.sum(hg==ag)/sims, np.sum(hg<ag)/sims, hg, ag
 
     def run_ce_importance_sampling(self, M, line, n_sims=20000):
-        # Simplified CE
         G = M.shape[0]
-        mu_h = np.sum(M.flatten() * (np.arange(G*G)//G))
-        mu_a = np.sum(M.flatten() * (np.arange(G*G)%G))
+        # Calculate means
+        i_idx, j_idx = np.indices((G,G))
+        mu_h = np.sum(M * i_idx)
+        mu_a = np.sum(M * j_idx)
+        
+        # Biased params
+        v_h, v_a = mu_h * 1.5, mu_a * 1.5
         rng = np.random.default_rng()
-        sh = rng.poisson(mu_h*1.5, n_sims)
-        sa = rng.poisson(mu_a*1.5, n_sims)
-        w = np.exp((sh*(math.log(mu_h)-math.log(mu_h*1.5)) - (mu_h-mu_h*1.5)) + (sa*(math.log(mu_a)-math.log(mu_a*1.5)) - (mu_a-mu_a*1.5)))
+        sh = rng.poisson(v_h, n_sims)
+        sa = rng.poisson(v_a, n_sims)
+        
+        # Likelihood Ratio
+        log_w = (sh*(np.log(mu_h)-np.log(v_h)) - (mu_h-v_h)) + \
+                (sa*(np.log(mu_a)-np.log(v_a)) - (mu_a-v_a))
+        w = np.exp(log_w)
+        
         est = np.sum(w * ((sh+sa)>line)) / n_sims
         return {"est": float(est)}
 
 # =========================
-# 4. 資料前處理與工具 (V38.4 Auto-Adapter)
+# 4. 資料處理工具 (V38.4 Auto-Adapter)
 # =========================
 def preprocess_uploaded_data(df: pd.DataFrame) -> pd.DataFrame:
-    """[V38.4] 自動標準化欄位名稱並生成缺失數據"""
-    # 1. 欄位映射字典 (常見格式轉內部格式)
     col_map = {
         'HomeTeam': 'home', 'Home': 'home', 'HT': 'home',
         'AwayTeam': 'away', 'Away': 'away', 'AT': 'away',
@@ -248,76 +315,31 @@ def preprocess_uploaded_data(df: pd.DataFrame) -> pd.DataFrame:
         'FTAG': 'away_goals', 'AG': 'away_goals', 'AwayGoals': 'away_goals',
         'Div': 'div', 'Date': 'date'
     }
-    
-    # 2. 重新命名欄位 (不區分大小寫)
-    df.columns = [c.strip() for c in df.columns] # 去除空白
+    df.columns = [c.strip() for c in df.columns]
     new_cols = {}
     for col in df.columns:
         for k, v in col_map.items():
             if col.lower() == k.lower():
-                new_cols[col] = v
-                break
+                new_cols[col] = v; break
     df = df.rename(columns=new_cols)
     
-    # 3. 確保關鍵欄位存在
     required = ['home', 'away', 'home_goals', 'away_goals']
-    missing = [c for c in required if c not in df.columns]
-    
-    if missing:
-        # 如果缺少關鍵比分或隊名，無法補救，直接回傳錯誤
-        st.error(f"❌ 數據缺少關鍵欄位: {missing}。請確認 CSV 包含球隊名稱與比分。")
-        return pd.DataFrame() # 空白代表失敗
+    if any(c not in df.columns for c in required):
+        st.error(f"❌ 缺少關鍵欄位: {required}")
+        return pd.DataFrame()
 
-    # 4. 自動生成 lh_pred, la_pred (如果缺失)
-    # 使用簡單的「聯盟平均法」作為 Baseline
     if 'lh_pred' not in df.columns or 'la_pred' not in df.columns:
-        st.info("ℹ️ 偵測到缺失預測數據 (lh_pred, la_pred)。正在根據歷史平均自動生成 Baseline...")
-        
-        # 計算全聯盟平均主場進球與客場進球
-        avg_home = df['home_goals'].mean()
-        avg_away = df['away_goals'].mean()
-        
-        # 簡單賦值 (進階版可用 Rolling Average，但這裡先求穩)
-        df['lh_pred'] = avg_home
-        df['la_pred'] = avg_away
-        
-        # 嘗試針對球隊做簡單的強度調整 (Rolling Mean)
-        # 建立一個簡單的字典來存球隊平均
+        st.info("ℹ️ 自動生成預期進球 (Based on League Avg)...")
+        avg_h, avg_a = df['home_goals'].mean(), df['away_goals'].mean()
+        df['lh_pred'] = avg_h; df['la_pred'] = avg_a
+        # Try simple rolling mean
         try:
-            home_avgs = df.groupby('home')['home_goals'].transform(lambda x: x.expanding().mean().shift(1))
-            away_avgs = df.groupby('away')['away_goals'].transform(lambda x: x.expanding().mean().shift(1))
-            
-            # 填補 NaN (第一場比賽用聯盟平均)
-            df['lh_pred'] = home_avgs.fillna(avg_home)
-            df['la_pred'] = away_avgs.fillna(avg_away)
-        except Exception:
-            pass # 如果失敗就用全域平均
-
+            h_roll = df.groupby('home')['home_goals'].transform(lambda x: x.shift().expanding().mean())
+            a_roll = df.groupby('away')['away_goals'].transform(lambda x: x.shift().expanding().mean())
+            df['lh_pred'] = h_roll.fillna(avg_h)
+            df['la_pred'] = a_roll.fillna(avg_a)
+        except: pass
     return df
-
-class SimpleKalmanFilter:
-    def __init__(self, r=1.0): self.x=r; self.P=1.0; self.Q=0.05; self.R=1.0
-    def predict(self): self.P+=self.Q; return self.x
-    def update(self, z):
-        K = self.P/(self.P+self.R)
-        self.x += K*(z-self.x)
-        self.P *= (1-K)
-        return self.x
-
-def run_kalman_tracking(df):
-    if df.empty: return pd.DataFrame(), {}
-    teams = set(df['home']).union(set(df['away']))
-    ratings = {t: SimpleKalmanFilter() for t in teams}
-    history = []
-    for _, r in df.iterrows():
-        h, a = r['home'], r['away']
-        hg, ag = r['home_goals'], r['away_goals']
-        rh_pre = ratings[h].predict()
-        ra_pre = ratings[a].predict()
-        rh_post = ratings[h].update(hg)
-        ra_post = ratings[a].update(ag)
-        history.append({'home': h, 'away': a, 'h_rating': rh_post, 'a_rating': ra_post})
-    return pd.DataFrame(history), ratings
 
 def fit_params_mle(df):
     if df.empty: return {"success": False}
@@ -326,8 +348,7 @@ def fit_params_mle(df):
         la_arr = df['la_pred'].values.astype(np.float64)
         h_arr = df['home_goals'].values.astype(np.int32)
         a_arr = df['away_goals'].values.astype(np.int32)
-    except Exception as e:
-        return {"success": False}
+    except: return {"success": False}
 
     def nll_func(params):
         lam3, rho, ha = params
@@ -337,17 +358,39 @@ def fit_params_mle(df):
     res = minimize(nll_func, [0.1, -0.1, 1.15], method='Nelder-Mead', tol=1e-3)
     return {"lam3": res.x[0], "rho": res.x[1], "home_adv": res.x[2], "success": res.success}
 
+def run_kalman_tracking(df):
+    class SimpleKalmanFilter:
+        def __init__(self, r=1.0): self.x=r; self.P=1.0; self.Q=0.05; self.R=1.0
+        def predict(self): self.P+=self.Q; return self.x
+        def update(self, z):
+            K = self.P/(self.P+self.R)
+            self.x += K*(z-self.x)
+            self.P *= (1-K)
+            return self.x
+    
+    if df.empty: return pd.DataFrame(), {}
+    teams = set(df['home']).union(set(df['away']))
+    ratings = {t: SimpleKalmanFilter() for t in teams}
+    hist = []
+    for _, r in df.iterrows():
+        h, a = r['home'], r['away']
+        rh, ra = ratings[h].predict(), ratings[a].predict()
+        n_h, n_a = ratings[h].update(r['home_goals']), ratings[a].update(r['away_goals'])
+        hist.append({'home': h, 'away': a, 'h_rating': n_h, 'a_rating': n_a})
+    return pd.DataFrame(hist), ratings
+
 # =========================
-# 5. UI (V38.4 Auto-Adapter)
+# 5. UI (V38.5 Restoration)
 # =========================
-st.set_page_config(page_title="Sniper V38.4", page_icon="🧿", layout="wide")
+st.set_page_config(page_title="Sniper V38.5", page_icon="🧿", layout="wide")
 st.markdown("<style>.metric-box { background-color: #f0f2f6; padding: 10px; border-radius: 8px; text-align: center; } .stProgress > div > div > div > div { background-color: #4CAF50; }</style>", unsafe_allow_html=True)
 
 with st.sidebar:
-    st.title("🧿 Sniper V38.4")
-    st.caption("Auto-Adapter Edition")
+    st.title("🧿 Sniper V38.5")
+    st.caption("Restored Edition")
     if HAS_NUMBA: st.success("⚡ Numba 加速：ON")
     else: st.warning("⚠️ Numba 加速：OFF")
+    
     app_mode = st.radio("功能模式：", ["🎯 單場深度預測", "🛡️ 風險對沖實驗室", "🔧 參數校正實驗室", "📈 聯賽歷史回測", "📚 劇本查詢"])
     st.divider()
     with st.expander("🛠️ 進階參數", expanded=False):
@@ -359,66 +402,160 @@ with st.sidebar:
         lam3_in = st.number_input("Lambda 3", 0.0, 0.5, 0.15, step=0.01)
         rho_in = st.number_input("Rho", -0.3, 0.3, -0.13, step=0.01)
         ha_in = st.number_input("Home Adv", 0.8, 1.6, 1.15, step=0.01)
+        risk_scale = st.slider("風險係數", 0.1, 1.0, 0.3)
         use_mock = st.checkbox("歷史記憶修正", True)
+        show_unc = st.toggle("顯示區間", True)
 
+# [MODE 1: 單場預測 (Full Restoration)]
 if app_mode == "🎯 單場深度預測":
-    st.header("🎯 單場深度預測 (V38)")
-    if "res" not in st.session_state: st.session_state.res = None
+    st.header("🎯 單場深度預測 (V38 Engine)")
+    if "analysis_results" not in st.session_state: st.session_state.analysis_results = None
     
     t1, t2 = st.tabs(["📋 貼上 JSON", "📂 上傳 JSON"])
     inp = None
     with t1:
         txt = st.text_area("JSON Input", height=100)
-        if txt: inp = json.loads(txt)
+        if txt: 
+            try: inp = json.loads(txt)
+            except: st.error("Format Error")
     with t2:
         f = st.file_uploader("JSON File", type=['json'])
         if f: inp = json.load(f)
 
-    if st.button("🚀 分析", type="primary") and inp:
+    if st.button("🚀 執行分析", type="primary") and inp:
         eng = SniperAnalystLogic(inp, 9, nb_alpha, lam3_in, rho_in, ha_in)
         lh, la, w = eng.calc_lambda()
         M, probs = eng.build_matrix_v38(lh, la, use_biv, use_dc)
+        
+        bonus = eng.get_market_trend_bonus()
+        odds = eng.market["1x2_odds"]
+        rid = eng.memory.analyze_scenario(lh, la, odds)
+        h_dat = eng.memory.recall_experience(rid)
+        penalty = eng.memory.calc_memory_penalty(h_dat["roi"]) if use_mock else 1.0
+        
+        sens_lv, sens_dr = eng.check_sensitivity(lh, la)
+        diff_p = abs(probs["hybrid"]["home"] - probs["market"]["home"])
+        conf, reasons = eng.calc_model_confidence(lh, la, diff_p, sens_dr)
+        
         hw, dr, aw, sh, sa = eng.run_monte_carlo_vectorized(M)
         
-        # Simple Analysis
-        odds = eng.market["1x2_odds"]
-        regime = eng.memory.analyze_scenario(lh, la, odds)
-        
-        st.session_state.res = {"eng": eng, "M": M, "lh": lh, "la": la, "sh": sh, "sa": sa, "probs": probs, "regime": regime}
+        st.session_state.analysis_results = {
+            "eng": eng, "M": M, "lh": lh, "la": la, "w": w,
+            "probs": probs, "bonus": bonus, "h_dat": h_dat, "pen": penalty,
+            "conf": conf, "reasons": reasons, "sh": sh, "sa": sa
+        }
 
-    if st.session_state.res:
-        r = st.session_state.res
-        eng = r["eng"]
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("主預期", f"{r['lh']:.2f}")
-        c2.metric("客預期", f"{r['la']:.2f}")
-        c3.metric("模型主勝", f"{r['probs']['hybrid']['home']:.1%}")
-        c4.metric("劇本", r["regime"])
+    if st.session_state.analysis_results:
+        res = st.session_state.analysis_results
+        eng, M, probs = res["eng"], res["M"], res["probs"]
         
-        t_v, t_s = st.tabs(["💰 價值", "🎲 模擬"])
-        with t_v:
-            # Simple EV Table
-            odds = eng.market["1x2_odds"]
-            evs = []
-            for k in ["home", "draw", "away"]:
-                p = r["probs"]["hybrid"][k]
-                o = odds[k]
-                evs.append({"Pick": k, "Odds": o, "Prob": f"{p:.1%}", "EV": f"{(p*o-1)*100:.1f}%"})
-            st.dataframe(pd.DataFrame(evs))
+        st.markdown("### 🔍 V38 戰術儀表板")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("主預期", f"{res['lh']:.2f}", delta="加權" if res["w"] else None)
+        c2.metric("客預期", f"{res['la']:.2f}")
+        c3.metric("混合主勝", f"{probs['hybrid']['home']:.1%}")
+        c4.metric("信心", f"{res['conf']:.0%}")
+        
+        if res["conf"] < 1.0:
+            with st.expander("⚠️ 扣分原因"):
+                for r in res["reasons"]: st.warning(r)
+
+        t_val, t_ai, t_score, t_sim = st.tabs(["💰 價值投資", "🧠 智能裁決", "🎯 波膽分佈", "🎲 極速模擬"])
+        
+        candidates = []
+        
+        # [Tab 1: Value Betting - Detailed Tables]
+        with t_val:
+            st.subheader("獨贏 (1x2)")
+            r_1x2 = []
+            for tag, k in [("主勝","home"),("和局","draw"),("客勝","away")]:
+                p = probs["hybrid"][k]
+                o = eng.market["1x2_odds"][k]
+                raw_ev = (p*o - 1)*100 + res["bonus"][k]
+                adj_ev = raw_ev * res["conf"] * res["pen"]
+                var, sharpe = calc_risk_metrics(p, o)
+                kelly = calc_risk_adj_kelly(adj_ev, var, risk_scale, p)
+                
+                ev_str = f"{adj_ev:+.1f}%"
+                if show_unc:
+                    l, h = eng.simulate_uncertainty(res['lh'], res['la'], adj_ev)
+                    ev_str += f" [{l:.1f}, {h:.1f}]"
+                
+                r_1x2.append({"Pick": tag, "Odds": o, "EV": ev_str, "Kelly": f"{kelly:.1f}%"})
+                if adj_ev > 1.0: 
+                    candidates.append({"pick": tag, "odds": o, "ev": adj_ev, "kelly": kelly, "type": "1x2"})
+            st.dataframe(pd.DataFrame(r_1x2), use_container_width=True)
             
-        with t_s:
-            hw = np.sum(r["sh"] > r["sa"]) / 500000
+            c_ah, c_ou = st.columns(2)
+            with c_ah:
+                st.subheader("亞盤 (AH)")
+                rows_ah = []
+                target = eng.market.get("target_odds", 1.90)
+                for hcap in eng.market.get("handicaps", [-0.5, 0.5]):
+                    raw = eng.ah_ev(M, hcap, target) + res["bonus"]["home"]
+                    adj = raw * res["conf"] * res["pen"]
+                    p_approx = (raw/100+1)/target
+                    var, _ = calc_risk_metrics(p_approx, target)
+                    kel = calc_risk_adj_kelly(adj, var, risk_scale, p_approx)
+                    rows_ah.append({"盤口": f"{hcap:+}", "EV": f"{adj:+.1f}%", "Kelly": f"{kel:.1f}%"})
+                    if adj > 1.5: candidates.append({"pick":f"AH {hcap:+}", "odds":target, "ev":adj, "kelly":kel, "type":"AH"})
+                st.dataframe(pd.DataFrame(rows_ah), use_container_width=True)
+                
+            with c_ou:
+                st.subheader("大小 (OU)")
+                rows_ou = []
+                idx_sum = np.add.outer(np.arange(eng.max_g), np.arange(eng.max_g))
+                for line in eng.market.get("goal_lines", [2.5]):
+                    p_over = float(M[idx_sum > line].sum())
+                    raw = (p_over*target - 1)*100
+                    adj = raw * res["conf"] * res["pen"]
+                    var, _ = calc_risk_metrics(p_over, target)
+                    kel = calc_risk_adj_kelly(adj, var, risk_scale, p_over)
+                    rows_ou.append({"盤口": f"Over {line}", "EV": f"{adj:+.1f}%", "Kelly": f"{kel:.1f}%"})
+                    if adj > 1.5: candidates.append({"pick":f"Over {line}", "odds":target, "ev":adj, "kelly":kel, "type":"OU"})
+                st.dataframe(pd.DataFrame(rows_ou), use_container_width=True)
+                
+            st.divider()
+            st.markdown("### 🏆 智能投資組合")
+            if candidates:
+                best = sorted(candidates, key=lambda x: x['ev'], reverse=True)[:3]
+                reco = []
+                for p in best:
+                    amt = unit_stake * (p['kelly']/100)
+                    reco.append([f"[{p['type']}] {p['pick']}", p['odds'], f"{p['ev']:+.1f}%", f"{p['kelly']:.1f}%", f"${amt:.1f}"])
+                st.dataframe(pd.DataFrame(reco, columns=["選項","賠率","EV","注碼%","金額"]), use_container_width=True)
+            else:
+                st.info("🚧 風險過高，建議觀望")
+
+        with t_ai:
+            st.write("V38 混合權重分析")
+            df_c = pd.DataFrame([probs["model"], probs["market"], probs["hybrid"]], index=["Model","Market","Hybrid"])
+            st.dataframe(df_c.style.format("{:.1%}"))
+            
+        with t_score:
+            st.write("波膽矩陣")
+            st.dataframe(pd.DataFrame(M[:6,:6]).style.format("{:.1%}"))
+            
+        with t_sim:
+            hw = np.sum(res["sh"] > res["sa"]) / 500000
             st.metric("MC 主勝率", f"{hw:.1%}")
             fig, ax = plt.subplots(figsize=(6,2))
-            ax.hist(r["sh"], alpha=0.5, label="H"); ax.hist(r["sa"], alpha=0.5, label="A"); ax.legend()
+            ax.hist(res["sh"], alpha=0.5, label="H"); ax.hist(res["sa"], alpha=0.5, label="A"); ax.legend()
             st.pyplot(fig)
+            st.divider()
+            st.subheader("稀有事件 (CE-IS)")
+            line_chk = 4.5
+            ce_res = eng.run_ce_importance_sampling(M, line_chk)
+            st.metric(f"大 {line_chk} 機率", f"{ce_res['est']:.2%}")
 
+# [MODE 2: 風險對沖 (Black Text Fix)]
 elif app_mode == "🛡️ 風險對沖實驗室":
     st.title("🛡️ 風險對沖")
-    if st.session_state.get("res"):
-        r = st.session_state.res
-        sh, sa = r["sh"], r["sa"]
-        eng = r["eng"]
+    if st.session_state.get("analysis_results"):
+        res = st.session_state.analysis_results
+        sh, sa = res["sh"], res["sa"]
+        eng = res["eng"]
+        
         if st.button("⚡ 計算組合優化"):
             cands = [
                 {"name": "主勝", "odds": eng.market["1x2_odds"]["home"], "cond": (sh > sa)},
@@ -432,24 +569,23 @@ elif app_mode == "🛡️ 風險對沖實驗室":
             
             def obj(w): return -(np.dot(w, mu) - 2.0 * np.dot(w.T, np.dot(sigma, w)))
             cons = ({'type': 'eq', 'fun': lambda w: np.sum(w)-1})
-            res = minimize(obj, [1/len(cands)]*len(cands), bounds=[(0,1)]*len(cands), constraints=cons)
+            opt = minimize(obj, [1/len(cands)]*len(cands), bounds=[(0,1)]*len(cands), constraints=cons)
             
-            st.write("建議配置:")
             cols = st.columns(len(cands))
-            for i, w in enumerate(res.x):
+            for i, w in enumerate(opt.x):
                 cols[i].metric(cands[i]["name"], f"{w:.1%}", delta=f"EV: {mu[i]*100:.1f}%")
             
-            # Black Text Fix
-            st.markdown("""<div style="background:#f0f2f6; padding:10px; color:black; border-radius:5px;">
-            <b>分析師評語:</b> 請依照上述比例分配資金以最大化夏普比率。</div>""", unsafe_allow_html=True)
+            st.markdown("""<div style="background:#f0f2f6; padding:10px; color:#333333; border-radius:5px;">
+            <h4 style="margin:0; color:blue;">👨‍🏫 首席分析師評語</h4>
+            <p style="color:#333333 !important;">請依照上述比例分配資金以最大化風險回報比 (Sharpe Ratio)。</p>
+            </div>""", unsafe_allow_html=True)
     else:
         st.warning("請先執行單場預測")
 
+# [MODE 3: 參數校正 (Multi-File)]
 elif app_mode == "🔧 參數校正實驗室":
-    st.header("🔧 參數校正 (自動適配版)")
-    
-    # [V38.4] 強制多選 + 自動適配
-    files = st.file_uploader("上傳 CSV/Excel (支援 FTHG/HomeTeam 等格式)", type=['csv','xlsx'], accept_multiple_files=True, key="up_v38_4")
+    st.header("🔧 參數校正 (自動適配)")
+    files = st.file_uploader("上傳 CSV/Excel (可多選)", type=['csv','xlsx'], accept_multiple_files=True, key="up_v38_5")
     
     if files:
         dfs = []
@@ -461,22 +597,21 @@ elif app_mode == "🔧 參數校正實驗室":
                 else:
                     import openpyxl; df = pd.read_excel(f)
                 
-                # [V38.4] 呼叫資料處理函式
                 df = preprocess_uploaded_data(df)
                 if not df.empty: dfs.append(df)
             except Exception as e: st.warning(f"{f.name} 失敗: {e}")
             
         if dfs:
             full_df = pd.concat(dfs, ignore_index=True)
-            st.write(f"成功處理 {len(full_df)} 筆數據 (已自動生成 lh_pred/la_pred)", full_df.head(3))
+            st.write(f"成功合併 {len(dfs)} 個檔案，共 {len(full_df)} 筆數據", full_df.head(3))
             
             c1, c2 = st.columns(2)
             with c1:
                 if st.button("⚡ MLE 擬合"):
                     with st.spinner("計算中..."):
-                        res = fit_params_mle(full_df)
-                    if res["success"]:
-                        st.success(f"建議: Lam3={res['lam3']:.2f}, Rho={res['rho']:.2f}, HA={res['home_adv']:.2f}")
+                        r = fit_params_mle(full_df)
+                    if r["success"]:
+                        st.success(f"建議參數: Lam3={r['lam3']:.3f}, Rho={r['rho']:.3f}, HA={r['home_adv']:.3f}")
                     else: st.error("收斂失敗")
             with c2:
                 if st.button("📈 Kalman 追蹤"):
