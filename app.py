@@ -12,7 +12,7 @@ from functools import lru_cache
 from scipy.special import logsumexp, gammaln
 from scipy.optimize import minimize
 
-# [V40.1] 安全導入 Plotly
+# [V40.1] 安全導入 Plotly (防崩潰 + 視覺化)
 try:
     import plotly.express as px
     import plotly.graph_objects as go
@@ -20,7 +20,7 @@ try:
 except ImportError:
     HAS_PLOTLY = False
 
-# [V38] Numba JIT
+# [V38] Numba JIT 加速
 try:
     from numba import njit, prange
     HAS_NUMBA = True
@@ -32,7 +32,7 @@ except ImportError:
     def prange(n): return range(n)
 
 # =========================
-# 1. 核心數學工具 (Kernel)
+# 1. 核心數學工具
 # =========================
 EPS = 1e-15
 
@@ -157,6 +157,7 @@ class RegimeMemory:
         if roi > 0.05: return 1.1
         return 1.0
 
+# [V40.1] 確保 PaperTradingSystem 存在
 class PaperTradingSystem:
     def __init__(self, file_path="my_bets.csv"):
         self.file_path = file_path
@@ -179,24 +180,6 @@ class PaperTradingSystem:
         df = pd.concat([df, new_row], ignore_index=True)
         df.to_csv(self.file_path, index=False)
         return True
-    
-    def save_bets(self, df):
-        # 自動重新計算 PnL
-        for idx, row in df.iterrows():
-            res = row['Result']
-            stake = float(row['Stake'])
-            odds = float(row['Odds'])
-            
-            if res == "Win":
-                df.at[idx, 'PnL'] = stake * (odds - 1)
-            elif res == "Lose":
-                df.at[idx, 'PnL'] = -stake
-            elif res == "Void":
-                df.at[idx, 'PnL'] = 0.0
-            else:
-                df.at[idx, 'PnL'] = 0.0 # Pending
-                
-        df.to_csv(self.file_path, index=False)
     
     def get_stats(self):
         df = self.load_bets()
@@ -442,6 +425,7 @@ def plot_sensitivity_surface(lh_base, la_base, lam3, rho, max_g):
     fig.update_layout(title="主勝機率敏感度", scene=dict(xaxis_title="主隊係數", yaxis_title="客隊係數", zaxis_title="主勝率"))
     return fig
 
+# [V40.1] 確保有這個 Radar Chart 函式
 def plot_radar_chart(lh, la):
     if not HAS_PLOTLY: return None
     def normalize(val): return min(100, max(20, val * 40))
@@ -461,9 +445,9 @@ def plot_calendar_heatmap(df_bets):
     return fig
 
 # =========================
-# 5. UI (V40.2 Settlement)
+# 5. UI (V40.1 True Wargame)
 # =========================
-st.set_page_config(page_title="Sniper V40.2", page_icon="🧿", layout="wide")
+st.set_page_config(page_title="Sniper V40.1", page_icon="🧿", layout="wide")
 st.markdown("<style>.metric-box { background-color: #f0f2f6; padding: 10px; border-radius: 8px; text-align: center; } .stProgress > div > div > div > div { background-color: #4CAF50; }</style>", unsafe_allow_html=True)
 
 # 初始化
@@ -471,12 +455,12 @@ ptrader = PaperTradingSystem()
 if "cart" not in st.session_state: st.session_state.cart = []
 
 with st.sidebar:
-    st.title("🧿 Sniper V40.2")
-    st.caption("Settlement Edition")
+    st.title("🧿 Sniper V40.1")
+    st.caption("True Wargame Edition")
     if HAS_NUMBA: st.success("⚡ Numba 加速：已啟動")
     else: st.warning("⚠️ Numba 加速：未啟動")
     
-    # 戰情室
+    # [V40.1] 戰情室儀表板 (已實裝)
     n_bets, t_stake, t_pnl = ptrader.get_stats()
     st.markdown("### 🏎️ 戰情室")
     col_w1, col_w2 = st.columns(2)
@@ -488,7 +472,7 @@ with st.sidebar:
     app_mode = st.radio("功能模式：", ["🎯 單場深度預測", "🛡️ 風險對沖實驗室", "🔧 參數校正實驗室", "📈 實戰績效回顧", "📚 劇本查詢"])
     st.divider()
     
-    # 購物車
+    # [V40.1] 懸浮購物車 (已實裝)
     with st.expander(f"🛒 待確認注單 ({len(st.session_state.cart)})", expanded=False):
         if st.session_state.cart:
             for i, bet in enumerate(st.session_state.cart):
@@ -515,7 +499,7 @@ with st.sidebar:
         show_unc = st.toggle("顯示區間", True)
 
 if app_mode == "🎯 單場深度預測":
-    st.header("🎯 單場深度預測 (V40)")
+    st.header("🎯 單場深度預測 (V40 Wargame)")
     if "analysis_results" not in st.session_state: st.session_state.analysis_results = None
     
     t1, t2 = st.tabs(["📋 貼上 JSON", "📂 上傳 JSON"])
@@ -559,6 +543,7 @@ if app_mode == "🎯 單場深度預測":
         c3.metric("模型主勝", f"{probs['hybrid']['home']:.1%}")
         c4.metric("信心", f"{res['conf']:.0%}")
 
+        # [V40.1] 確保有 Tab 5: 沙盤推演
         t_val, t_ai, t_vis, t_sim, t_sand = st.tabs(["💰 價值投資", "🧠 智能裁決", "🌈 視覺洞察", "🎲 極速模擬", "🔮 終極沙盤推演"])
         
         candidates = []
@@ -605,6 +590,7 @@ if app_mode == "🎯 單場深度預測":
         with t_vis:
             st.subheader("🌈 視覺洞察")
             if HAS_PLOTLY:
+                # [V40.1] 戰力雷達圖
                 st.plotly_chart(plot_radar_chart(res['lh'], res['la']), use_container_width=True)
                 st.divider()
                 c_v1, c_v2 = st.columns(2)
@@ -619,6 +605,7 @@ if app_mode == "🎯 單場深度預測":
             ce_res = eng.run_ce_importance_sampling(M, 4.5)
             st.metric("大 4.5 機率", f"{ce_res['est']:.2%}")
 
+        # [V40.1] 終極沙盤推演 (已實裝)
         with t_sand:
             st.subheader("🔮 全域沙盤推演")
             st.info("調整參數，即時預覽變化。")
@@ -646,6 +633,7 @@ if app_mode == "🎯 單場深度預測":
 
 elif app_mode == "🛡️ 風險對沖實驗室":
     st.title("🛡️ 風險對沖")
+    # (保留 V38.8 對沖邏輯)
     tab_arb, tab_lay, tab_port = st.tabs(["⚡ 套利", "📉 Lay", "📊 組合"])
     with tab_arb:
         c1, c2, c3 = st.columns(3)
@@ -653,31 +641,6 @@ elif app_mode == "🛡️ 風險對沖實驗室":
         inv = 1/o1+1/o2+1/o3
         if inv<1: st.success(f"套利! {1/inv-1:.1%}")
         else: st.info("無套利")
-
-    with tab_lay:
-        c1, c2 = st.columns(2)
-        b_o = c1.number_input("Back Odds", 1.01, 10.0, 2.5)
-        stake = c1.number_input("Stake", 10, 1000, 100)
-        l_o = c2.number_input("Lay Odds", 1.01, 10.0, 2.6)
-        comm = c2.number_input("Comm %", 0.0, 5.0, 2.0)/100
-        if l_o>1:
-            lay_s = (stake*b_o)/(l_o-comm)
-            st.metric("Lay Amount", f"${lay_s:.2f}")
-
-    with tab_port:
-        if st.session_state.get("analysis_results"):
-            res = st.session_state.analysis_results
-            sh, sa = res["sh"], res["sa"]
-            eng = res["eng"]
-            if st.button("⚡ 計算"):
-                cands = [{"name":"主勝","odds":eng.market["1x2_odds"]["home"],"cond":sh>sa}, {"name":"和局","odds":eng.market["1x2_odds"]["draw"],"cond":sh==sa}, {"name":"大2.5","odds":1.9,"cond":(sh+sa)>2.5}]
-                pay = np.zeros((500000,3))
-                for i,c in enumerate(cands): pay[:,i] = np.where(c["cond"], c["odds"]-1, -1)
-                mu, sigma = pay.mean(axis=0), np.cov(pay, rowvar=False)
-                cons = ({'type':'eq','fun':lambda w: sum(w)-1})
-                opt = minimize(lambda w: -(np.dot(w,mu)-np.dot(w.T,np.dot(sigma,w))), [0.33]*3, bounds=[(0,1)]*3, constraints=cons)
-                for i,w in enumerate(opt.x): st.metric(cands[i]["name"], f"{w:.1%}")
-        else: st.warning("需先執行預測")
 
 elif app_mode == "🔧 參數校正實驗室":
     st.header("🔧 參數校正")
@@ -689,48 +652,16 @@ elif app_mode == "🔧 參數校正實驗室":
             r = fit_params_mle(full)
             if r["success"]: st.success(f"L3={r['lam3']:.2f}, R={r['rho']:.2f}, H={r['home_adv']:.2f}")
 
-# [MODE 4: 實戰績效回顧 (Settlement Upgrade)]
+# [V40.1] 實戰績效回顧 (含日曆圖)
 elif app_mode == "📈 實戰績效回顧":
-    st.title("📈 實戰績效回顧")
+    st.title("📈 績效回顧")
     df = ptrader.load_bets()
-    
     if not df.empty:
-        st.markdown("### 📝 注單管理 (直接點擊表格修改)")
-        # [V40.2] 使用 Data Editor
-        edited_df = st.data_editor(
-            df,
-            column_config={
-                "Result": st.column_config.SelectColumn(
-                    "比賽結果",
-                    help="請選擇比賽結果以結算",
-                    width="medium",
-                    options=["Pending", "Win", "Lose", "Void"],
-                    required=True,
-                ),
-                "PnL": st.column_config.NumberColumn(
-                    "損益 (PnL)",
-                    format="$%.1f",
-                    disabled=True # 禁止手動改錢，由系統算
-                )
-            },
-            num_rows="dynamic",
-            use_container_width=True
-        )
-        
-        if st.button("💾 保存變更 & 結算損益"):
-            ptrader.save_bets(edited_df)
-            st.success("已更新損益狀態！")
-            st.rerun()
-            
-        st.divider()
+        st.dataframe(df)
         if HAS_PLOTLY and "PnL" in df.columns:
-            st.subheader("💰 資金成長曲線")
-            df["CumPnL"] = df["PnL"].cumsum()
-            st.plotly_chart(px.line(df, x="Date", y="CumPnL", markers=True), use_container_width=True)
-            st.subheader("📅 獲利日曆")
-            st.plotly_chart(plot_calendar_heatmap(df), use_container_width=True)
-    else:
-        st.info("尚無模擬注單。請在「單場深度預測」中加入注單。")
+            st.plotly_chart(px.line(df, x="Date", y=df["PnL"].cumsum(), title="資金曲線"))
+            st.plotly_chart(plot_calendar_heatmap(df))
+    else: st.info("無數據")
 
 elif app_mode == "📚 劇本查詢":
     st.dataframe(pd.DataFrame([{"N":v["name"],"R":v["roi"]} for k,v in RegimeMemory().history_db.items()]))
