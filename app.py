@@ -92,7 +92,6 @@ class RegimeMemory:
             "MidTable_Standard": { "name": "😐 中游例行", "roi": 0.000 }
         }
 
-    # [FIXED] 接收 odds 字典，避免 AttributeError
     def analyze_scenario(self, lh: float, la: float, odds: Dict) -> str:
         home_odd = odds.get("home", 2.0)
         if home_odd < 1.30: return "MarketHype_Fav"
@@ -310,9 +309,9 @@ def fit_params_mle(history_df: pd.DataFrame) -> Dict[str, float]:
     return {"lam3": result.x[0], "rho": result.x[1], "success": result.success}
 
 # =========================
-# 5. Streamlit UI (V37.2 Omni-Analyst)
+# 5. Streamlit UI (V37.3 Black Ink)
 # =========================
-st.set_page_config(page_title="Sniper V37.2 Omni-Analyst", page_icon="🧿", layout="wide")
+st.set_page_config(page_title="Sniper V37.3", page_icon="🧿", layout="wide")
 
 st.markdown("""
 <style>
@@ -322,8 +321,8 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 with st.sidebar:
-    st.title("🧿 Sniper V37.2")
-    st.caption("Omni-Analyst Edition")
+    st.title("🧿 Sniper V37.3")
+    st.caption("Black Ink Edition")
     st.markdown("---")
     app_mode = st.radio("功能模式：", ["🎯 單場深度預測", "🛡️ 風險對沖實驗室", "🔧 參數校正實驗室", "📈 聯賽歷史回測", "📚 劇本查詢"])
     st.divider()
@@ -364,7 +363,6 @@ if app_mode == "🎯 單場深度預測":
             M, probs_detail = engine.build_matrix_v37(lh, la, use_biv=use_biv, use_dc=use_dc)
             market_bonus = engine.get_market_trend_bonus()
             
-            # [FIXED] 參數傳遞修正
             odds_dict = engine.market["1x2_odds"]
             regime_id = engine.memory.analyze_scenario(lh, la, odds_dict)
             history_data = engine.memory.recall_experience(regime_id)
@@ -505,7 +503,7 @@ if app_mode == "🎯 單場深度預測":
             st.metric(f"大 {line_check} 機率", f"{is_res['est']:.2%}")
 
 # =========================
-# 模式 2: 風險對沖實驗室 (連動 + 智能評語)
+# 模式 2: 風險對沖實驗室 (連動 + 智能評語 + 黑字修正)
 # =========================
 elif app_mode == "🛡️ 風險對沖實驗室":
     st.title("🛡️ 風險對沖實驗室 (Hedging Lab)")
@@ -554,7 +552,7 @@ elif app_mode == "🛡️ 風險對沖實驗室":
             st.metric("建議 Lay 金額", f"${lay_stake:.2f}")
             st.write(f"需預留負債: **${liability:.2f}** | 鎖定利潤: **${profit:.2f}**")
 
-    # 3. 組合優化 (加入智能評語)
+    # 3. 組合優化 (智能評語 + 黑色字體)
     with tab_port:
         st.subheader("智能組合優化 (Portfolio Optimization)")
         if has_data:
@@ -604,7 +602,7 @@ elif app_mode == "🛡️ 風險對沖實驗室":
                         else:
                             cols[i].metric(candidates[i]["name"], "0.0%", delta_color="off")
                     
-                    # --- 👨‍🏫 首席分析師總結 ---
+                    # --- 👨‍🏫 首席分析師總結 (黑字修正版) ---
                     st.divider()
                     st.markdown("### 👨‍🏫 首席分析師評語 (Verdict)")
                     
@@ -637,8 +635,9 @@ elif app_mode == "🛡️ 風險對沖實驗室":
                         verdict_title = "🔵 一般價值投資"
                         verdict_text = f"發現些微價值，主要集中在 {top_pick}，但優勢並非壓倒性。建議小注怡情。"
 
+                    # CSS 修正：加入 color: #000000;
                     st.markdown(f"""
-                    <div style="padding: 15px; border-radius: 5px; border-left: 5px solid {verdict_color}; background-color: #f0f2f6;">
+                    <div style="padding: 15px; border-radius: 5px; border-left: 5px solid {verdict_color}; background-color: #f0f2f6; color: #000000;">
                         <h4 style="margin:0; color:{verdict_color};">{verdict_title}</h4>
                         <p style="margin-top:10px; font-size:16px;">{verdict_text}</p>
                         <hr>
