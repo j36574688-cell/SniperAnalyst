@@ -23,7 +23,7 @@ except ImportError:
     def prange(n): return range(n)
 
 # =========================
-# 1. 核心數學工具 (V38.7 Kernel)
+# 1. 核心數學工具 (V38.8 Kernel)
 # =========================
 EPS = 1e-15
 
@@ -178,6 +178,7 @@ class SniperAnalystLogic:
         strength_gap = (lh_att - la_att)
         crush_factor = 1.05 if strength_gap > 0.5 else 1.0
         
+        # Apply Home Adv
         lh = (lh_att * la_def / 1.35) * self.home_adv * crush_factor
         la = (la_att * lh_def / 1.35)
         
@@ -290,7 +291,7 @@ class SniperAnalystLogic:
         return {"est": float(est)}
 
 # =========================
-# 4. 資料處理工具 (V38.4 Auto-Adapter)
+# 4. 資料處理工具
 # =========================
 def preprocess_uploaded_data(df: pd.DataFrame) -> pd.DataFrame:
     col_map = {
@@ -364,14 +365,14 @@ def run_kalman_tracking(df):
     return pd.DataFrame(hist), ratings
 
 # =========================
-# 5. UI (V38.6 Full House + TC)
+# 5. UI (V38.8 Insight & Expanded)
 # =========================
-st.set_page_config(page_title="Sniper V38.6", page_icon="🧿", layout="wide")
+st.set_page_config(page_title="Sniper V38.8", page_icon="🧿", layout="wide")
 st.markdown("<style>.metric-box { background-color: #f0f2f6; padding: 10px; border-radius: 8px; text-align: center; } .stProgress > div > div > div > div { background-color: #4CAF50; }</style>", unsafe_allow_html=True)
 
 with st.sidebar:
-    st.title("🧿 Sniper V38.6")
-    st.caption("Traditional Chinese Edition")
+    st.title("🧿 Sniper V38.8")
+    st.caption("Insight Edition")
     if HAS_NUMBA: st.success("⚡ Numba 加速：已啟動")
     else: st.warning("⚠️ Numba 加速：未啟動 (請檢查環境)")
     
@@ -390,7 +391,7 @@ with st.sidebar:
         use_mock = st.checkbox("歷史記憶修正", True)
         show_unc = st.toggle("顯示區間", True)
 
-# [MODE 1: 單場預測 (Full Restoration + TC)]
+# [MODE 1: 單場預測 (Expanded)]
 if app_mode == "🎯 單場深度預測":
     st.header("🎯 單場深度預測 (V38 引擎)")
     if "analysis_results" not in st.session_state: st.session_state.analysis_results = None
@@ -473,8 +474,9 @@ if app_mode == "🎯 單場深度預測":
                     "凱利建議": f"{kelly:.1f}%",
                     "建議金額": f"${stake_amt:.0f}"
                 })
-                if adj_ev > 1.0: 
-                    candidates.append({"pick": tag, "odds": o, "ev": adj_ev, "kelly": kelly, "type": "1x2"})
+                # [V38.8] Lowered threshold from 1.0 to 0.2 to show more options
+                if adj_ev > 0.2: 
+                    candidates.append({"pick": tag, "odds": o, "ev": adj_ev, "kelly": kelly, "type": "1x2", "prob": p, "sharpe": sharpe})
             st.dataframe(pd.DataFrame(r_1x2), use_container_width=True)
             
             c_ah, c_ou = st.columns(2)
@@ -486,7 +488,7 @@ if app_mode == "🎯 單場深度預測":
                     raw = eng.ah_ev(M, hcap, target) + res["bonus"]["home"]
                     adj = raw * res["conf"] * res["pen"]
                     p_approx = (raw/100+1)/target
-                    var, _ = calc_risk_metrics(p_approx, target)
+                    var, sharpe = calc_risk_metrics(p_approx, target)
                     kel = calc_risk_adj_kelly(adj, var, risk_scale, p_approx)
                     stake_amt = unit_stake * (kel/100.0)
                     
@@ -498,7 +500,8 @@ if app_mode == "🎯 單場深度預測":
                         "凱利": f"{kel:.1f}%",
                         "建議金額": f"${stake_amt:.0f}"
                     })
-                    if adj > 1.5: candidates.append({"pick":f"AH {hcap:+}", "odds":target, "ev":adj, "kelly":kel, "type":"AH"})
+                    # Lowered threshold
+                    if adj > 0.5: candidates.append({"pick":f"AH {hcap:+}", "odds":target, "ev":adj, "kelly":kel, "type":"AH", "prob": p_approx, "sharpe": sharpe})
                 st.dataframe(pd.DataFrame(rows_ah), use_container_width=True)
                 
             with c_ou:
@@ -509,7 +512,7 @@ if app_mode == "🎯 單場深度預測":
                     p_over = float(M[idx_sum > line].sum())
                     raw = (p_over*target - 1)*100
                     adj = raw * res["conf"] * res["pen"]
-                    var, _ = calc_risk_metrics(p_over, target)
+                    var, sharpe = calc_risk_metrics(p_over, target)
                     kel = calc_risk_adj_kelly(adj, var, risk_scale, p_over)
                     stake_amt = unit_stake * (kel/100.0)
                     
@@ -521,20 +524,30 @@ if app_mode == "🎯 單場深度預測":
                         "凱利": f"{kel:.1f}%",
                         "建議金額": f"${stake_amt:.0f}"
                     })
-                    if adj > 1.5: candidates.append({"pick":f"Over {line}", "odds":target, "ev":adj, "kelly":kel, "type":"OU"})
+                    # Lowered threshold
+                    if adj > 0.5: candidates.append({"pick":f"Over {line}", "odds":target, "ev":adj, "kelly":kel, "type":"OU", "prob": p_over, "sharpe": sharpe})
                 st.dataframe(pd.DataFrame(rows_ou), use_container_width=True)
                 
             st.divider()
-            st.markdown("### 🏆 智能投資組合建議")
+            st.markdown("### 🏆 智能投資組合建議 (Smart Portfolio)")
             if candidates:
-                best = sorted(candidates, key=lambda x: x['ev'], reverse=True)[:3]
+                # [V38.8] Sort by EV and show more columns
+                best = sorted(candidates, key=lambda x: x['ev'], reverse=True)
                 reco = []
                 for p in best:
                     amt = unit_stake * (p['kelly']/100)
-                    reco.append([f"[{p['type']}] {p['pick']}", p['odds'], f"{p['ev']:+.1f}%", f"{p['kelly']:.1f}%", f"${amt:.1f}"])
-                st.dataframe(pd.DataFrame(reco, columns=["策略選項","賠率","預期回報(EV)","權重%","建議金額($)"]), use_container_width=True)
+                    reco.append({
+                        "策略選項": f"[{p['type']}] {p['pick']}",
+                        "賠率": p['odds'],
+                        "真實機率": f"{p['prob']:.1%}",
+                        "預期回報(EV)": f"{p['ev']:+.1f}%",
+                        "夏普值": f"{p['sharpe']:.2f}",
+                        "凱利注碼": f"{p['kelly']:.1f}%",
+                        "建議金額": f"${amt:.1f}"
+                    })
+                st.dataframe(pd.DataFrame(reco), use_container_width=True)
             else:
-                st.info("🚧 本場風險過高，建議觀望")
+                st.info("🚧 本場風險過高，暫無推薦注單。")
 
         with t_ai:
             st.write("V38 混合權重分析")
@@ -564,17 +577,15 @@ if app_mode == "🎯 單場深度預測":
             ce_res = eng.run_ce_importance_sampling(M, line_chk)
             st.metric(f"總分大於 {line_chk} 機率", f"{ce_res['est']:.2%}")
 
-# [MODE 2: 風險對沖 (Full Restoration)]
+# [MODE 2: 風險對沖 (Full Restoration + Smart Verdict)]
 elif app_mode == "🛡️ 風險對沖實驗室":
     st.title("🛡️ 風險對沖實驗室")
     
     tab_arb, tab_lay, tab_port = st.tabs(["⚡ 1x2 套利掃描", "📉 交易所對沖", "📊 智能組合優化"])
     
-    # 1. 套利
     with tab_arb:
         st.subheader("無風險套利計算 (Arbitrage)")
         c1, c2, c3 = st.columns(3)
-        # 預設賠率如果 session 有就抓，沒有就給預設值
         def_o = {"home":2.0, "draw":3.0, "away":4.0}
         if st.session_state.get("analysis_results"):
             def_o = st.session_state.analysis_results["eng"].market["1x2_odds"]
@@ -597,7 +608,6 @@ elif app_mode == "🛡️ 風險對沖實驗室":
         else:
             st.info(f"無套利空間 (Book Sum: {inv_sum:.2%})")
 
-    # 2. Lay 對沖
     with tab_lay:
         st.subheader("交易所對沖計算器 (Back-Lay)")
         lc1, lc2 = st.columns(2)
@@ -614,7 +624,7 @@ elif app_mode == "🛡️ 風險對沖實驗室":
             st.metric("建議 Lay 金額", f"${lay_stake:.2f}")
             st.write(f"需預留負債: **${liability:.2f}** | 鎖定利潤: **${profit:.2f}**")
 
-    # 3. 組合優化
+    # 3. 組合優化 (智能評語修復)
     with tab_port:
         st.subheader("智能組合優化 (Portfolio Optimization)")
         if st.session_state.get("analysis_results"):
@@ -637,13 +647,48 @@ elif app_mode == "🛡️ 風險對沖實驗室":
                 cons = ({'type': 'eq', 'fun': lambda w: np.sum(w)-1})
                 opt = minimize(obj, [1/len(cands)]*len(cands), bounds=[(0,1)]*len(cands), constraints=cons)
                 
+                weights = opt.x
                 cols = st.columns(len(cands))
-                for i, w in enumerate(opt.x):
+                active_bets = []
+                for i, w in enumerate(weights):
                     cols[i].metric(cands[i]["name"], f"{w:.1%}", delta=f"EV: {mu[i]*100:.1f}%")
+                    if w > 0.05: active_bets.append((cands[i]["name"], w))
                 
-                st.markdown("""<div style="background:#f0f2f6; padding:10px; color:#333333; border-radius:5px;">
-                <h4 style="margin:0; color:blue;">👨‍🏫 首席分析師評語</h4>
-                <p style="color:#333333 !important;">請依照上述比例分配資金以最大化風險回報比 (Sharpe Ratio)。此配置已考慮了各選項之間的相關性與對沖效果。</p>
+                # [V38.8] 智能動態評語 (Insight Logic)
+                st.divider()
+                st.markdown("### 👨‍🏫 首席分析師評語 (Verdict)")
+                
+                max_w = max(weights)
+                top_pick = max(active_bets, key=lambda x: x[1])[0] if active_bets else "無"
+                total_ret = np.dot(weights, mu) * 100
+                
+                v_color = "blue"
+                v_title = "觀察"
+                v_text = ""
+
+                if not active_bets or total_ret < 0.2:
+                    v_color = "red"
+                    v_title = "⛔ 觀望建議"
+                    v_text = "目前賠率結構下，即使最優化配置也難以產生足夠的風險回報比。建議**空手觀望**或尋找場中(Live)機會。"
+                elif max_w > 0.7:
+                    v_color = "green"
+                    v_title = "🔥 強力單注出擊"
+                    v_text = f"模型對 **【{top_pick}】** 展現極高信心 (權重 > 70%)。數據顯示該選項的獨立優勢明顯，建議**集中資金單打**，無需過度分散。"
+                elif len(active_bets) >= 2:
+                    v_color = "orange"
+                    v_title = "⚖️ 結構化對沖組合"
+                    picks_str = " + ".join([p[0] for p in active_bets])
+                    v_text = f"建議採取 **「{picks_str}」** 的組合策略。透過分散配置，可在保持預期回報的同時，顯著降低單一選項倒灶的波動風險。"
+                else:
+                    v_color = "blue"
+                    v_title = "🔵 一般價值投資"
+                    v_text = "市場存在些微價值，建議依比例小注怡情。"
+
+                st.markdown(f"""<div style="background:#f0f2f6; padding:15px; color:#333333; border-left: 5px solid {v_color}; border-radius:5px;">
+                <h4 style="margin:0; color:{v_color}; font-weight:bold;">{v_title}</h4>
+                <p style="color:#333333 !important; margin-top:10px;">{v_text}</p>
+                <hr style="border-color:#ccc;">
+                <small style="color:#555;">組合預期年化回報 (Portfolio EV): <b>{total_ret:.2f}%</b></small>
                 </div>""", unsafe_allow_html=True)
         else:
             st.warning("⚠️ 請先執行「單場深度預測」以獲取模擬數據")
@@ -677,7 +722,7 @@ elif app_mode == "🔧 參數校正實驗室":
                     with st.spinner("計算中..."):
                         r = fit_params_mle(full_df)
                     if r["success"]:
-                        st.success(f"建議參數: Lam3={r['lam3']:.3f}, Rho={r['rho']:.3f}, HA={r['home_adv']:.3f}")
+                        st.success(f"建議參數: Lam3={r['lam3']:.3f}, Rho={r['rho']:.3f}, HA={r['home_adv']:.2f}")
                     else: st.error("收斂失敗")
             with c2:
                 if st.button("📈 Kalman 動態追蹤"):
