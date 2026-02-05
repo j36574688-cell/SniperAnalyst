@@ -12,7 +12,7 @@ from functools import lru_cache
 from scipy.special import logsumexp, gammaln
 from scipy.optimize import minimize
 
-# [V39.1] 安全導入 Plotly (防崩潰)
+# [V39.1] 安全導入 Plotly
 try:
     import plotly.express as px
     import plotly.graph_objects as go
@@ -20,7 +20,7 @@ try:
 except ImportError:
     HAS_PLOTLY = False
 
-# [V38] 嘗試導入 Numba 進行 JIT 加速
+# [V38] Numba JIT
 try:
     from numba import njit, prange
     HAS_NUMBA = True
@@ -32,7 +32,7 @@ except ImportError:
     def prange(n): return range(n)
 
 # =========================
-# 1. 核心數學工具 (V38.8 Kernel)
+# 1. 核心數學工具 (V40.0 Kernel - Unchanged)
 # =========================
 EPS = 1e-15
 
@@ -119,7 +119,7 @@ def get_matrix_cached(lh, la, max_g, nb_alpha):
     return M / M.sum()
 
 # =========================
-# 2. 全景記憶與實戰系統
+# 2. 全景記憶與實戰系統 (V40.0 Enhanced)
 # =========================
 class RegimeMemory:
     def __init__(self, db_path="regime_db.json"):
@@ -179,6 +179,14 @@ class PaperTradingSystem:
         df = pd.concat([df, new_row], ignore_index=True)
         df.to_csv(self.file_path, index=False)
         return True
+    
+    def get_stats(self):
+        df = self.load_bets()
+        if df.empty: return 0, 0, 0
+        total_bets = len(df)
+        total_stake = df["Stake"].sum()
+        total_pnl = df["PnL"].sum()
+        return total_bets, total_stake, total_pnl
 
 # =========================
 # 3. 分析引擎邏輯
@@ -205,6 +213,7 @@ class SniperAnalystLogic:
 
         lh_att, lh_def = att_def_w(self.h)
         la_att, la_def = att_def_w(self.a)
+        
         strength_gap = (lh_att - la_att)
         crush_factor = 1.05 if strength_gap > 0.5 else 1.0
         
@@ -415,30 +424,82 @@ def plot_sensitivity_surface(lh_base, la_base, lam3, rho, max_g):
     fig.update_layout(title="主勝機率敏感度 (戰力變化)", scene=dict(xaxis_title="主隊係數", yaxis_title="客隊係數", zaxis_title="主勝率"))
     return fig
 
+# [V40.0] 新增：戰力雷達圖
+def plot_radar_chart(lh, la):
+    if not HAS_PLOTLY: return None
+    # 這裡將 lambda 轉化為 0-100 的能力值 (Mock logic)
+    def normalize(val): return min(100, max(20, val * 40))
+    
+    categories = ['進攻能力', '防守壓迫', '近期狀態', '主客優勢', '運氣指數']
+    
+    fig = go.Figure()
+    fig.add_trace(go.Scatterpolar(
+        r=[normalize(lh), normalize(1/la), 75, 80, 50],
+        theta=categories, fill='toself', name='主隊'
+    ))
+    fig.add_trace(go.Scatterpolar(
+        r=[normalize(la), normalize(1/lh), 65, 40, 50],
+        theta=categories, fill='toself', name='客隊'
+    ))
+    fig.update_layout(polar=dict(radialaxis=dict(visible=True, range=[0, 100])), showlegend=True, title="球隊戰力雷達")
+    return fig
+
+# [V40.0] 新增：績效日曆熱力圖
+def plot_calendar_heatmap(df_bets):
+    if not HAS_PLOTLY or df_bets.empty: return None
+    if "Date" not in df_bets.columns or "PnL" not in df_bets.columns: return None
+    
+    df_bets['DateObj'] = pd.to_datetime(df_bets['Date']).dt.date
+    daily = df_bets.groupby('DateObj')['PnL'].sum().reset_index()
+    
+    fig = px.density_heatmap(daily, x="DateObj", y="PnL", title="獲利日曆熱力圖", nbinsx=20)
+    return fig
+
 # =========================
-# 5. UI (V39.1 Robust)
+# 5. UI (V40.0 Wargame)
 # =========================
-st.set_page_config(page_title="Sniper V39.1", page_icon="🧿", layout="wide")
+st.set_page_config(page_title="Sniper V40.0", page_icon="🧿", layout="wide")
 st.markdown("<style>.metric-box { background-color: #f0f2f6; padding: 10px; border-radius: 8px; text-align: center; } .stProgress > div > div > div > div { background-color: #4CAF50; }</style>", unsafe_allow_html=True)
 
+# [V40.0] 初始化全局狀態
+ptrader = PaperTradingSystem()
+if "cart" not in st.session_state: st.session_state.cart = []
+
 with st.sidebar:
-    st.title("🧿 Sniper V39.1")
-    st.caption("Robust Edition")
-    if HAS_NUMBA: st.success("⚡ Numba 加速：已啟動")
-    else: st.warning("⚠️ Numba 加速：未啟動 (請檢查環境)")
+    st.title("🧿 Sniper V40.0")
+    st.caption("Wargame Edition")
     
-    app_mode = st.radio("功能模式：", ["🎯 單場深度預測", "🛡️ 風險對沖實驗室", "🔧 參數校正實驗室", "📈 實戰績效回顧", "📚 劇本查詢"])
+    # [V40.0] 戰情室儀表板
+    n_bets, t_stake, t_pnl = ptrader.get_stats()
+    st.markdown("### 🏎️ 戰情室")
+    col_w1, col_w2 = st.columns(2)
+    col_w1.metric("模擬本金", "$10,000") # Mock
+    col_w2.metric("累積損益", f"${t_pnl:.1f}", delta=f"{t_pnl/100:.1f}%")
+    st.metric("今日注單 / 總額", f"{len(st.session_state.cart)} / {n_bets}", f"${t_stake:.0f}")
+    
     st.divider()
     
-    with st.expander("💱 賠率轉換器"):
-        odd_in = st.number_input("輸入賠率", 1.01)
-        fmt = st.selectbox("格式", ["Decimal (歐式)", "American (美式 +150)", "Fractional (2/1)"])
-        if fmt == "American (美式 +150)":
-            if odd_in > 0: st.write(f"歐式: {1 + odd_in/100:.2f}")
-            else: st.write(f"歐式: {1 + 100/abs(odd_in):.2f}")
-        elif fmt == "Fractional (2/1)":
-            st.write(f"歐式: {1 + odd_in:.2f}")
+    app_mode = st.radio("戰術模式：", ["🎯 單場深度預測", "🛡️ 風險對沖實驗室", "🔧 參數校正實驗室", "📈 實戰績效回顧", "📚 劇本查詢"])
     
+    st.divider()
+    
+    # [V40.0] 懸浮購物車
+    with st.expander(f"🛒 待確認注單 ({len(st.session_state.cart)})", expanded=False):
+        if st.session_state.cart:
+            for i, bet in enumerate(st.session_state.cart):
+                st.write(f"{i+1}. {bet['sel']} @ {bet['odds']} (${bet['stake']})")
+            if st.button("✅ 一鍵下注 (Confirm)"):
+                for bet in st.session_state.cart:
+                    ptrader.add_bet(bet['sel'], bet['odds'], bet['stake'])
+                st.session_state.cart = []
+                st.success("下注成功！")
+                st.rerun()
+            if st.button("🗑️ 清空"):
+                st.session_state.cart = []
+                st.rerun()
+        else:
+            st.info("暫無注單")
+
     with st.expander("🛠️ 進階參數設定", expanded=False):
         unit_stake = st.number_input("單注本金 ($)", 10, 10000, 100)
         nb_alpha = st.slider("Alpha (NB)", 0.05, 0.25, 0.12)
@@ -452,8 +513,9 @@ with st.sidebar:
         use_mock = st.checkbox("歷史記憶修正", True)
         show_unc = st.toggle("顯示區間", True)
 
+# [MODE 1: 單場預測 (Wargame Sandbox)]
 if app_mode == "🎯 單場深度預測":
-    st.header("🎯 單場深度預測 (V39 視覺引擎)")
+    st.header("🎯 單場深度預測 (V40 Wargame)")
     if "analysis_results" not in st.session_state: st.session_state.analysis_results = None
     
     t1, t2 = st.tabs(["📋 貼上 JSON", "📂 上傳 JSON"])
@@ -505,10 +567,10 @@ if app_mode == "🎯 單場深度預測":
             with st.expander("⚠️ 信心扣分原因"):
                 for r in res["reasons"]: st.warning(r)
 
-        t_val, t_ai, t_vis, t_sim = st.tabs(["💰 價值投資", "🧠 智能裁決", "🌈 視覺洞察", "🎲 極速模擬"])
+        # [V40.0] 新增 Tab 5: 沙盤推演
+        t_val, t_ai, t_vis, t_sim, t_sand = st.tabs(["💰 價值投資", "🧠 智能裁決", "🌈 視覺洞察", "🎲 極速模擬", "🔮 終極沙盤推演"])
         
         candidates = []
-        ptrader = PaperTradingSystem()
         
         with t_val:
             st.subheader("獨贏 (1x2)")
@@ -547,7 +609,7 @@ if app_mode == "🎯 單場深度預測":
                     var, sharpe = calc_risk_metrics(p_approx, target)
                     kel = calc_risk_adj_kelly(adj, var, risk_scale, p_approx)
                     stake_amt = unit_stake * (kel/100.0)
-                    rows_ah.append({"盤口": f"{hcap:+}", "機率": f"{p_approx:.1%}", "EV": f"{adj:+.1f}%", "Kelly": f"{kel:.1f}%"})
+                    rows_ah.append({"盤口": f"{hcap:+}", "機率": f"{p_approx:.1%}", "EV": f"{adj:+.1f}%", "Kelly": f"{kel:.1f}%", "建議": f"${stake_amt:.0f}"})
                     if adj > 0.5: candidates.append({"pick":f"AH {hcap:+}", "odds":target, "ev":adj, "kelly":kel, "type":"AH", "prob": p_approx, "sharpe": sharpe})
                 st.dataframe(pd.DataFrame(rows_ah), use_container_width=True)
                 
@@ -562,7 +624,7 @@ if app_mode == "🎯 單場深度預測":
                     var, sharpe = calc_risk_metrics(p_over, target)
                     kel = calc_risk_adj_kelly(adj, var, risk_scale, p_over)
                     stake_amt = unit_stake * (kel/100.0)
-                    rows_ou.append({"盤口": f">{line}", "機率": f"{p_over:.1%}", "EV": f"{adj:+.1f}%", "Kelly": f"{kel:.1f}%"})
+                    rows_ou.append({"盤口": f">{line}", "機率": f"{p_over:.1%}", "EV": f"{adj:+.1f}%", "Kelly": f"{kel:.1f}%", "建議": f"${stake_amt:.0f}"})
                     if adj > 0.5: candidates.append({"pick":f"Over {line}", "odds":target, "ev":adj, "kelly":kel, "type":"OU", "prob": p_over, "sharpe": sharpe})
                 st.dataframe(pd.DataFrame(rows_ou), use_container_width=True)
                 
@@ -574,21 +636,20 @@ if app_mode == "🎯 單場深度預測":
                 for p in best:
                     amt = unit_stake * (p['kelly']/100)
                     reco.append({
-                        "選項": f"[{p['type']}] {p['pick']}",
-                        "賠率": p['odds'],
-                        "EV": f"{p['ev']:+.1f}%",
-                        "Sharpe": f"{p['sharpe']:.2f}",
-                        "Kelly": f"{p['kelly']:.1f}%",
-                        "建議": f"${amt:.1f}"
+                        "選項": f"[{p['type']}] {p['pick']}", "賠率": p['odds'], "EV": f"{p['ev']:+.1f}%",
+                        "Sharpe": f"{p['sharpe']:.2f}", "Kelly": f"{p['kelly']:.1f}%", "建議": f"${amt:.1f}"
                     })
                 st.dataframe(pd.DataFrame(reco), use_container_width=True)
                 
-                bet_pick = st.selectbox("選擇要加入模擬單的注單", [f"[{p['type']}] {p['pick']}" for p in best])
-                if st.button("🛒 加入模擬單 (Paper Trade)"):
+                # [V40.0] 加入購物車功能
+                c_cart1, c_cart2 = st.columns([3, 1])
+                bet_pick = c_cart1.selectbox("選擇加入購物車", [f"[{p['type']}] {p['pick']}" for p in best])
+                if c_cart2.button("➕ 加入"):
                     sel_bet = next(p for p in best if f"[{p['type']}] {p['pick']}" == bet_pick)
                     amt = unit_stake * (sel_bet['kelly']/100)
-                    ptrader.add_bet(bet_pick, sel_bet['odds'], amt)
-                    st.success(f"已記錄: {bet_pick} @ {sel_bet['odds']} (${amt:.1f})")
+                    st.session_state.cart.append({"sel": bet_pick, "odds": sel_bet['odds'], "stake": amt})
+                    st.success(f"已加入購物車")
+                    st.rerun()
             else:
                 st.info("🚧 本場風險過高，暫無推薦注單。")
 
@@ -600,36 +661,75 @@ if app_mode == "🎯 單場深度預測":
         with t_vis:
             st.subheader("🌈 視覺化洞察")
             if HAS_PLOTLY:
+                # [V40.0] 雷達圖
+                st.plotly_chart(plot_radar_chart(res['lh'], res['la']), use_container_width=True)
+                st.divider()
                 c_v1, c_v2 = st.columns(2)
                 with c_v1:
                     st.plotly_chart(plot_score_heatmap(M), use_container_width=True)
                 with c_v2:
                     fig_dist = px.histogram(x=res["sh"], nbins=10, labels={'x':'主隊進球'}, title="主隊進球分佈")
                     st.plotly_chart(fig_dist, use_container_width=True)
-                
-                st.divider()
                 st.plotly_chart(plot_sensitivity_surface(res['lh'], res['la'], lam3_in, rho_in, 9), use_container_width=True)
             else:
-                st.warning("⚠️ 請安裝 plotly 以啟用視覺化功能")
+                st.warning("⚠️ 請安裝 plotly")
             
         with t_sim:
             hw = np.sum(res["sh"] > res["sa"]) / 500000
             dr = np.sum(res["sh"] == res["sa"]) / 500000
             aw = np.sum(res["sh"] < res["sa"]) / 500000
-            
             c1, c2, c3 = st.columns(3)
             c1.metric("MC 主勝", f"{hw:.1%}")
             c2.metric("MC 和局", f"{dr:.1%}")
             c3.metric("MC 客勝", f"{aw:.1%}")
+            st.divider()
+            st.subheader("稀有事件 (CE-IS)")
+            ce_res = eng.run_ce_importance_sampling(M, 4.5)
+            st.metric("大 4.5 機率", f"{ce_res['est']:.2%}")
+            
+        # [V40.0] 終極沙盤推演 Tab
+        with t_sand:
+            st.subheader("🔮 全域沙盤推演 (Universal Sandbox)")
+            st.info("調整以下因子，即時預覽對期望值 (EV) 的影響。")
+            
+            sc1, sc2, sc3 = st.columns(3)
+            mod_att_h = sc1.slider("主隊進攻狀態", 0.5, 1.5, 1.0, 0.05)
+            mod_def_a = sc1.slider("客隊防守狀態", 0.5, 1.5, 1.0, 0.05)
+            
+            mod_att_a = sc2.slider("客隊進攻狀態", 0.5, 1.5, 1.0, 0.05)
+            mod_def_h = sc2.slider("主隊防守狀態", 0.5, 1.5, 1.0, 0.05)
+            
+            red_card = sc3.checkbox("🔴 假設主隊紅牌 (早盤)")
+            luck_factor = sc3.slider("🎲 運氣偏差 (Luck)", 0.8, 1.2, 1.0, 0.05)
+            
+            # Real-time recalculation
+            lh_new = res['lh'] * mod_att_h * mod_def_a * luck_factor
+            la_new = res['la'] * mod_att_a * mod_def_h * luck_factor
+            
+            if red_card:
+                lh_new *= 0.4 # 紅牌重創進攻
+                la_new *= 1.3 # 對手進攻大增
             
             st.divider()
-            st.subheader("稀有事件機率 (CE-IS)")
-            line_chk = 4.5
-            ce_res = eng.run_ce_importance_sampling(M, line_chk)
-            st.metric(f"總分大於 {line_chk} 機率", f"{ce_res['est']:.2%}")
+            st.write(f"調整後預期：主 {lh_new:.2f} vs 客 {la_new:.2f}")
             
-            csv = pd.DataFrame(reco).to_csv(index=False).encode('utf-8')
-            st.download_button("📥 下載戰術報告 (CSV)", csv, "sniper_report.csv", "text/csv")
+            # Re-build matrix fast
+            M_new, _ = eng.build_matrix_v38(lh_new, la_new, use_biv, use_dc)
+            p_h_new = float(np.sum(np.tril(M_new,-1)))
+            p_a_new = float(np.sum(np.triu(M_new,1)))
+            
+            c_res1, c_res2 = st.columns(2)
+            c_res1.metric("新主勝率", f"{p_h_new:.1%}", delta=f"{p_h_new - probs['hybrid']['home']:.1%}")
+            
+            # EV Check
+            o_h = eng.market["1x2_odds"]["home"]
+            new_ev = (p_h_new * o_h - 1) * 100
+            c_res2.metric(f"主勝 ({o_h}) 新 EV", f"{new_ev:.1f}%", delta_color="normal" if new_ev>0 else "inverse")
+            
+            if new_ev > 2.0:
+                st.success("🔥 即便在這種極端情境下，主勝依然有價值！")
+            elif new_ev < -5.0:
+                st.error("💀 風險警告：此情境下主勝期望值崩盤。")
 
 # [MODE 2: 風險對沖]
 elif app_mode == "🛡️ 風險對沖實驗室":
@@ -699,10 +799,9 @@ elif app_mode == "🔧 參數校正實驗室":
                 h, _ = run_kalman_tracking(full)
                 st.dataframe(h.tail())
 
-# [MODE 4: 實戰績效回顧 (New)]
+# [MODE 4: 實戰績效回顧]
 elif app_mode == "📈 實戰績效回顧":
     st.title("📈 實戰績效回顧")
-    ptrader = PaperTradingSystem()
     df_bets = ptrader.load_bets()
     
     if not df_bets.empty:
@@ -724,6 +823,11 @@ elif app_mode == "📈 實戰績效回顧":
             df_bets["CumPnL"] = df_bets["PnL"].cumsum()
             fig = px.line(df_bets, x="Date", y="CumPnL", title="模擬資金成長曲線", markers=True)
             st.plotly_chart(fig)
+            
+            # [V40.0] 日曆熱力圖
+            st.divider()
+            st.subheader("📅 獲利日曆")
+            st.plotly_chart(plot_calendar_heatmap(df_bets), use_container_width=True)
     else:
         st.info("尚無模擬注單。請在「單場深度預測」中加入注單。")
 
