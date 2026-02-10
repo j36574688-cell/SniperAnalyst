@@ -7,6 +7,8 @@ import matplotlib.pyplot as plt
 import glob
 import os
 import datetime
+import sqlite3
+import hashlib
 from typing import Dict, List, Tuple, Any, Optional
 from functools import lru_cache
 from scipy.special import logsumexp, gammaln
@@ -119,12 +121,153 @@ def get_matrix_cached(lh, la, max_g, nb_alpha):
     return M / M.sum()
 
 # =========================
-# 2. 全景記憶與實戰系統
+# 2. [V42.0] 用戶系統與資料庫核心
+# =========================
+class AuthManager:
+    def __init__(self, db_path="sniper_v42.db"):
+        self.db_path = db_path
+        self.init_db()
+
+    def init_db(self):
+        """初始化資料庫與資料表"""
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        # 用戶表
+        c.execute('''CREATE TABLE IF NOT EXISTS users (
+                        username TEXT PRIMARY KEY, 
+                        password_hash TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        is_admin INTEGER DEFAULT 0)''')  # Added is_admin field
+        # 注單表 (新增 user_id)
+        c.execute('''CREATE TABLE IF NOT EXISTS bets (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id TEXT,
+                        date TEXT,
+                        selection TEXT,
+                        odds REAL,
+                        stake REAL,
+                        result TEXT,
+                        pnl REAL,
+                        FOREIGN KEY(user_id) REFERENCES users(username))''')
+        
+        # Check if admin user exists, if not create one
+        # Default admin: admin / admin123 (You should change this immediately)
+        c.execute("SELECT * FROM users WHERE username='admin'")
+        if not c.fetchone():
+             admin_pass = self.hash_password("admin123")
+             c.execute("INSERT INTO users (username, password_hash, is_admin) VALUES (?, ?, ?)", ("admin", admin_pass, 1))
+             conn.commit()
+
+        conn.commit()
+        conn.close()
+
+    def hash_password(self, password):
+        # 使用 SHA256 + Salt (簡單有效的加密)
+        salt = "SniperTarget" 
+        return hashlib.sha256((password + salt).encode()).hexdigest()
+
+    def register(self, username, password):
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        try:
+            hashed = self.hash_password(password)
+            c.execute("INSERT INTO users (username, password_hash) VALUES (?, ?)", (username, hashed))
+            conn.commit()
+            return True, "註冊成功！請登入。"
+        except sqlite3.IntegrityError:
+            return False, "用戶名已存在。"
+        finally:
+            conn.close()
+
+    def login(self, username, password):
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        hashed = self.hash_password(password)
+        c.execute("SELECT * FROM users WHERE username=? AND password_hash=?", (username, hashed))
+        user = c.fetchone()
+        conn.close()
+        # user structure: (username, password_hash, created_at, is_admin)
+        if user:
+             return True, user[3] # Return success and is_admin status
+        return False, 0
+
+    # New Admin Function: Get all users
+    def get_all_users(self):
+        conn = sqlite3.connect(self.db_path)
+        df = pd.read_sql_query("SELECT username, created_at, is_admin FROM users", conn)
+        conn.close()
+        return df
+    
+    # New Admin Function: Delete user
+    def delete_user(self, username):
+        if username == 'admin': return False # Prevent deleting super admin
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        c.execute("DELETE FROM users WHERE username=?", (username,))
+        c.execute("DELETE FROM bets WHERE user_id=?", (username,)) # Cascade delete bets
+        conn.commit()
+        conn.close()
+        return True
+
+class PaperTradingSystemSQL:
+    def __init__(self, user_id, db_path="sniper_v42.db"):
+        self.db_path = db_path
+        self.user_id = user_id # 鎖定當前用戶
+
+    def load_bets(self):
+        conn = sqlite3.connect(self.db_path)
+        df = pd.read_sql_query("SELECT * FROM bets WHERE user_id = ?", conn, params=(self.user_id,))
+        conn.close()
+        return df
+
+    def add_bet(self, selection, odds, stake):
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        date_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+        c.execute("INSERT INTO bets (user_id, date, selection, odds, stake, result, pnl) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                  (self.user_id, date_str, selection, odds, stake, "Pending", 0.0))
+        conn.commit()
+        conn.close()
+
+    def save_bets(self, df):
+        # This function updates bets based on the edited DataFrame
+        # It's crucial to match by ID to ensure correct updates
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        
+        for index, row in df.iterrows():
+            bet_id = row['id']
+            result = row['Result']
+            stake = float(row['Stake'])
+            odds = float(row['Odds'])
+            
+            # Recalculate PnL based on result
+            pnl = 0.0
+            if result == "Win":
+                pnl = stake * (odds - 1)
+            elif result == "Lose":
+                pnl = -stake
+            elif result == "Void":
+                pnl = 0.0
+            
+            # Update the record in database
+            c.execute("UPDATE bets SET result=?, pnl=? WHERE id=? AND user_id=?", 
+                      (result, pnl, bet_id, self.user_id))
+            
+        conn.commit()
+        conn.close()
+
+    def get_stats(self):
+        df = self.load_bets()
+        if df.empty: return 0, 0, 0
+        return len(df), df["Stake"].sum(), df["PnL"].sum()
+
+# =========================
+# 3. 分析引擎邏輯 (Kernel)
 # =========================
 class RegimeMemory:
-    def __init__(self, db_path="regime_db.json"):
-        self.db_path = db_path
-        self.default_db = {
+    def __init__(self):
+        self.history_db = {
             "Bore_Draw_Stalemate": { "name": "🛡️ 雙重鐵桶", "roi": 0.219, "bets": 2150 }, 
             "Relegation_Dog": { "name": "🐕 保級受讓", "roi": 0.083, "bets": 1840 },
             "Fallen_Giant": { "name": "📉 豪門崩盤", "roi": -0.008, "bets": 920 },
@@ -133,82 +276,14 @@ class RegimeMemory:
             "MarketHype_Fav": { "name": "🔥 大熱倒灶", "roi": -0.080, "bets": 1560 },
             "MidTable_Standard": { "name": "😐 中游例行", "roi": 0.000, "bets": 5000 }
         }
-        self.history_db = self.load_db()
-
-    def load_db(self) -> Dict:
-        if os.path.exists(self.db_path):
-            try:
-                with open(self.db_path, 'r', encoding='utf-8') as f: return json.load(f)
-            except: return self.default_db
-        return self.default_db
-
     def analyze_scenario(self, lh, la, odds) -> str:
         h = odds.get("home", 2.0)
         if h < 1.30: return "MarketHype_Fav"
         if (lh+la) < 2.2: return "Bore_Draw_Stalemate"
-        if h < 2.0: return "Fortress_Home"
         return "MidTable_Standard"
-
     def recall_experience(self, rid: str) -> Dict:
         return self.history_db.get(rid, {"name": "未知", "roi": 0.0, "bets": 0})
 
-    def calc_memory_penalty(self, roi: float) -> float:
-        if roi < -0.05: return 0.7
-        if roi > 0.05: return 1.1
-        return 1.0
-
-class PaperTradingSystem:
-    def __init__(self, file_path="my_bets.csv"):
-        self.file_path = file_path
-        
-    def load_bets(self):
-        if os.path.exists(self.file_path):
-            try:
-                return pd.read_csv(self.file_path)
-            except:
-                return pd.DataFrame(columns=["Date", "Selection", "Odds", "Stake", "Result", "PnL"])
-        return pd.DataFrame(columns=["Date", "Selection", "Odds", "Stake", "Result", "PnL"])
-        
-    def add_bet(self, selection, odds, stake):
-        df = self.load_bets()
-        new_row = pd.DataFrame([{
-            "Date": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
-            "Selection": selection,
-            "Odds": odds,
-            "Stake": stake,
-            "Result": "Pending",
-            "PnL": 0.0
-        }])
-        df = pd.concat([df, new_row], ignore_index=True)
-        df.to_csv(self.file_path, index=False)
-        return True
-    
-    def save_bets(self, df):
-        for idx, row in df.iterrows():
-            res = row['Result']
-            stake = float(row['Stake'])
-            odds = float(row['Odds'])
-            if res == "Win":
-                df.at[idx, 'PnL'] = stake * (odds - 1)
-            elif res == "Lose":
-                df.at[idx, 'PnL'] = -stake
-            elif res == "Void":
-                df.at[idx, 'PnL'] = 0.0
-            else:
-                df.at[idx, 'PnL'] = 0.0 
-        df.to_csv(self.file_path, index=False)
-    
-    def get_stats(self):
-        df = self.load_bets()
-        if df.empty: return 0, 0, 0
-        total_bets = len(df)
-        total_stake = df["Stake"].sum()
-        total_pnl = df["PnL"].sum()
-        return total_bets, total_stake, total_pnl
-
-# =========================
-# 3. 分析引擎邏輯
-# =========================
 class SniperAnalystLogic:
     def __init__(self, json_data, max_g=9, nb_alpha=0.12, lam3=0.0, rho=-0.13, home_adv=1.15):
         self.data = json_data if isinstance(json_data, dict) else json.loads(json_data)
@@ -228,20 +303,15 @@ class SniperAnalystLogic:
             form_factor = 1.0 + (np.dot(trend[-len(w):], w[-len(trend):]) * 0.1)
             return (0.3 * team["offensive_stats"]["goals_scored_avg"] + 0.7 * xg) * form_factor, \
                    (0.3 * team["defensive_stats"]["goals_conceded_avg"] + 0.7 * xga)
-
         lh_att, lh_def = att_def_w(self.h)
         la_att, la_def = att_def_w(self.a)
-        
         strength_gap = (lh_att - la_att)
         crush_factor = 1.05 if strength_gap > 0.5 else 1.0
-        
         lh = (lh_att * la_def / 1.35) * self.home_adv * crush_factor
         la = (la_att * lh_def / 1.35)
-        
         if self.h["context_modifiers"].get("missing_key_defender"): lh *= 0.9 
         if self.h["context_modifiers"].get("missing_key_defender"): la *= 1.25
         if self.a["context_modifiers"].get("missing_key_defender"): lh *= 1.20
-        
         return lh, la, True
 
     def build_matrix_v38(self, lh, la, use_biv=True, use_dc=True):
@@ -249,11 +319,9 @@ class SniperAnalystLogic:
         M = np.zeros((G, G))
         l3 = max(self.lam3, 0.001) if use_biv else 0.0
         l1, l2 = max(0.01, lh-l3), max(0.01, la-l3)
-        
         for i in range(G):
             for j in range(G):
                 M[i,j] = math.exp(biv_poisson_logpmf_fast(i, j, l1, l2, l3))
-        
         if use_dc:
             rho = self.rho
             def tau(x, y):
@@ -264,39 +332,28 @@ class SniperAnalystLogic:
                 return 1.0
             for i in range(2):
                 for j in range(2): M[i,j] *= tau(i,j)
-            
         M /= M.sum()
-        
-        imp = get_true_implied_prob(self.market["1x2_odds"])
+        imp = {"home": 1/self.market["1x2_odds"]["home"], "draw": 1/self.market["1x2_odds"]["draw"], "away": 1/self.market["1x2_odds"]["away"]}
+        total_imp = sum(imp.values())
+        imp = {k: v/total_imp for k, v in imp.items()}
         ph, pd, pa = float(np.sum(np.tril(M,-1))), float(np.sum(np.diag(M))), float(np.sum(np.triu(M,1)))
-        
         w = 0.7 if abs(ph - imp["home"]) < 0.2 else 0.5
         th = w*ph + (1-w)*imp["home"]
         td = w*pd + (1-w)*imp["draw"]
         ta = w*pa + (1-w)*imp["away"]
-        
         M_hybrid = M.copy()
         M_hybrid[np.tril_indices(G,-1)] *= (th/ph if ph>0 else 1)
         M_hybrid[np.diag_indices(G)] *= (td/pd if pd>0 else 1)
         M_hybrid[np.triu_indices(G,1)] *= (ta/pa if pa>0 else 1)
         M_hybrid /= M_hybrid.sum()
-        
         return M_hybrid, {"model": {"home": ph, "draw": pd, "away": pa}, "market": imp, "hybrid": {"home": th, "draw": td, "away": ta}}
-
-    def get_market_trend_bonus(self):
-        bonus = {"home":0.0, "draw":0.0, "away":0.0}
-        op, cu = self.market.get("opening_odds"), self.market.get("1x2_odds")
-        if not op or not cu: return bonus
-        for k in bonus:
-            drop = max(0.0, (op[k] - cu[k]) / op[k])
-            bonus[k] = min(3.0, drop * 30.0)
-        return bonus
 
     def ah_ev(self, M, hcap, odds):
         q = int(round(hcap * 4))
         if q % 2 != 0: return 0.5 * self.ah_ev(M, (q+1)/4.0, odds) + 0.5 * self.ah_ev(M, (q-1)/4.0, odds)
         idx_diff = np.subtract.outer(np.arange(self.max_g), np.arange(self.max_g)) 
-        payoff = np.select([idx_diff + hcap > 0.001, np.abs(idx_diff + hcap) <= 0.001], [odds-1, 0], default=-1)
+        r_matrix = idx_diff + hcap
+        payoff = np.select([r_matrix > 0.001, np.abs(r_matrix) <= 0.001, r_matrix < -0.001], [odds - 1, 0, -1], default=-1)
         return np.sum(M * payoff) * 100
 
     def check_sensitivity(self, lh, la):
@@ -312,15 +369,6 @@ class SniperAnalystLogic:
         if sens > 0.15: score *= 0.8; reasons.append("模型對運氣球敏感")
         if (lh + la) > 3.5: score *= 0.9; reasons.append("高變異風險 (xG > 3.5)")
         return score, reasons
-
-    def simulate_uncertainty(self, lh, la, base_ev):
-        evs = []
-        for _ in range(50):
-            lh_s = lh * np.random.normal(1.0, 0.1)
-            la_s = la * np.random.normal(1.0, 0.1)
-            ratio = (lh_s - la_s) / (lh - la) if abs(lh - la) > 0.1 else 1.0
-            evs.append(base_ev * ratio)
-        return np.percentile(evs, 5), np.percentile(evs, 95)
 
     def run_monte_carlo_vectorized(self, M, sims=500000):
         rng = np.random.default_rng()
@@ -345,18 +393,9 @@ class SniperAnalystLogic:
         est = np.sum(w * ((sh+sa)>line)) / n_sims
         return {"est": float(est)}
 
-# =========================
-# 4. 資料處理工具
-# =========================
 def preprocess_uploaded_data(df: pd.DataFrame) -> pd.DataFrame:
     df.columns = [str(c).strip() for c in df.columns]
-    col_map = {
-        'hometeam': 'home', 'home': 'home', 'ht': 'home', 'team1': 'home',
-        'awayteam': 'away', 'away': 'away', 'at': 'away', 'team2': 'away',
-        'fthg': 'home_goals', 'hg': 'home_goals', 'homegoals': 'home_goals', 'score1': 'home_goals',
-        'ftag': 'away_goals', 'ag': 'away_goals', 'awaygoals': 'away_goals', 'score2': 'away_goals',
-        'div': 'div', 'date': 'date'
-    }
+    col_map = {'hometeam': 'home', 'home': 'home', 'awayteam': 'away', 'away': 'away', 'fthg': 'home_goals', 'ftag': 'away_goals'}
     new_cols = {}
     for col in df.columns:
         c_lower = col.lower().replace(" ", "").replace("_", "")
@@ -364,16 +403,11 @@ def preprocess_uploaded_data(df: pd.DataFrame) -> pd.DataFrame:
     df = df.rename(columns=new_cols)
     required = ['home', 'away', 'home_goals', 'away_goals']
     if any(c not in df.columns for c in required): return pd.DataFrame()
-    if 'lh_pred' not in df.columns or 'la_pred' not in df.columns:
+    if 'lh_pred' not in df.columns:
         avg_h = df['home_goals'].mean()
         avg_a = df['away_goals'].mean()
-        df['lh_pred'] = avg_h; df['la_pred'] = avg_a
-        try:
-            h_roll = df.groupby('home')['home_goals'].transform(lambda x: x.shift().expanding().mean())
-            a_roll = df.groupby('away')['away_goals'].transform(lambda x: x.shift().expanding().mean())
-            df['lh_pred'] = h_roll.fillna(avg_h)
-            df['la_pred'] = a_roll.fillna(avg_a)
-        except: pass
+        df['lh_pred'] = avg_h
+        df['la_pred'] = avg_a
     return df
 
 def fit_params_mle(df):
@@ -391,35 +425,12 @@ def fit_params_mle(df):
     res = minimize(nll_func, [0.1, -0.1, 1.15], method='Nelder-Mead', tol=1e-3)
     return {"lam3": res.x[0], "rho": res.x[1], "home_adv": res.x[2], "success": res.success}
 
-def run_kalman_tracking(df):
-    class SimpleKalmanFilter:
-        def __init__(self, r=1.0): self.x=r; self.P=1.0; self.Q=0.05; self.R=1.0
-        def predict(self): self.P+=self.Q; return self.x
-        def update(self, z):
-            K = self.P/(self.P+self.R)
-            self.x += K*(z-self.x)
-            self.P *= (1-K)
-            return self.x
-    if df.empty: return pd.DataFrame(), {}
-    teams = set(df['home']).union(set(df['away']))
-    ratings = {t: SimpleKalmanFilter() for t in teams}
-    hist = []
-    for _, r in df.iterrows():
-        h, a = r['home'], r['away']
-        rh, ra = ratings[h].predict(), ratings[a].predict()
-        n_h, n_a = ratings[h].update(r['home_goals']), ratings[a].update(r['away_goals'])
-        hist.append({'home': h, 'away': a, 'h_rating': n_h, 'a_rating': n_a})
-    return pd.DataFrame(hist), ratings
-
-# [V39/40 視覺化工具]
+# [V39/40 視覺化]
 def plot_score_heatmap(M):
     if not HAS_PLOTLY: return None
     limit = 6
     labels = [str(i) for i in range(limit)]
-    fig = px.imshow(M[:limit, :limit], 
-                    labels=dict(x="客隊進球", y="主隊進球", color="機率"),
-                    x=labels, y=labels, text_auto='.1%')
-    fig.update_layout(title="波膽機率熱力圖", width=500, height=400)
+    fig = px.imshow(M[:limit, :limit], labels=dict(x="客隊", y="主隊", color="機率"), x=labels, y=labels, text_auto='.1%')
     return fig
 
 def plot_sensitivity_surface(lh_base, la_base, lam3, rho, max_g):
@@ -437,375 +448,301 @@ def plot_sensitivity_surface(lh_base, la_base, lam3, rho, max_g):
                     p += math.exp(biv_poisson_logpmf_fast(h, a, max(0.01, l1-lam3), max(0.01, l2-lam3), lam3))
             Z[i,j] = p
     fig = go.Figure(data=[go.Surface(z=Z, x=X, y=Y)])
-    fig.update_layout(title="主勝機率敏感度", scene=dict(xaxis_title="主隊係數", yaxis_title="客隊係數", zaxis_title="主勝率"))
+    fig.update_layout(title="主勝敏感度", scene=dict(xaxis_title="主隊", yaxis_title="客隊", zaxis_title="勝率"))
     return fig
 
 def plot_radar_chart(lh, la):
     if not HAS_PLOTLY: return None
-    def normalize(val): return min(100, max(20, val * 40))
-    categories = ['進攻能力', '防守壓迫', '近期狀態', '主客優勢', '運氣指數']
     fig = go.Figure()
-    fig.add_trace(go.Scatterpolar(r=[normalize(lh), normalize(1/la), 75, 80, 50], theta=categories, fill='toself', name='主隊'))
-    fig.add_trace(go.Scatterpolar(r=[normalize(la), normalize(1/lh), 65, 40, 50], theta=categories, fill='toself', name='客隊'))
-    fig.update_layout(polar=dict(radialaxis=dict(visible=True, range=[0, 100])), showlegend=True, title="球隊戰力雷達")
+    fig.add_trace(go.Scatterpolar(r=[min(100, lh*40), min(100, 1/la*40), 75, 80], theta=['進攻', '防守', '近況', '主客'], fill='toself', name='主隊'))
+    fig.add_trace(go.Scatterpolar(r=[min(100, la*40), min(100, 1/lh*40), 65, 40], theta=['進攻', '防守', '近況', '主客'], fill='toself', name='客隊'))
+    fig.update_layout(polar=dict(radialaxis=dict(visible=True, range=[0, 100])), title="戰力雷達")
     return fig
 
 def plot_calendar_heatmap(df_bets):
     if not HAS_PLOTLY or df_bets.empty: return None
-    if "Date" not in df_bets.columns or "PnL" not in df_bets.columns: return None
-    df_bets['DateObj'] = pd.to_datetime(df_bets['Date']).dt.date
-    daily = df_bets.groupby('DateObj')['PnL'].sum().reset_index()
-    fig = px.density_heatmap(daily, x="DateObj", y="PnL", title="獲利日曆熱力圖", nbinsx=20)
+    if "date" not in df_bets.columns or "pnl" not in df_bets.columns: return None
+    df_bets['DateObj'] = pd.to_datetime(df_bets['date']).dt.date
+    daily = df_bets.groupby('DateObj')['pnl'].sum().reset_index()
+    fig = px.density_heatmap(daily, x="DateObj", y="pnl", title="獲利日曆", nbinsx=20)
     return fig
 
 # =========================
-# 5. UI (V41.1 Analyst Restore)
+# 6. 主程式架構 (Platform)
 # =========================
-st.set_page_config(page_title="Sniper V41.1", page_icon="🧿", layout="wide")
+st.set_page_config(page_title="Sniper V42.0", page_icon="🧿", layout="wide")
 st.markdown("<style>.metric-box { background-color: #f0f2f6; padding: 10px; border-radius: 8px; text-align: center; } .stProgress > div > div > div > div { background-color: #4CAF50; }</style>", unsafe_allow_html=True)
 
 # 初始化
-ptrader = PaperTradingSystem()
-if "cart" not in st.session_state: st.session_state.cart = []
+auth = AuthManager()
+if "logged_in" not in st.session_state:
+    st.session_state.logged_in = False
+    st.session_state.username = None
+    st.session_state.is_admin = 0
 
-with st.sidebar:
-    st.title("🧿 Sniper V41.1")
-    st.caption("Perfection Edition")
-    if HAS_NUMBA: st.success("⚡ Numba 加速：已啟動")
-    else: st.warning("⚠️ Numba 加速：未啟動")
-    
-    # 戰情室
-    n_bets, t_stake, t_pnl = ptrader.get_stats()
-    st.markdown("### 🏎️ 戰情室")
-    col_w1, col_w2 = st.columns(2)
-    col_w1.metric("模擬本金", "$10,000")
-    col_w2.metric("累積損益", f"${t_pnl:.1f}", delta=f"{t_pnl/100:.1f}%")
-    st.metric("今日注單 / 總額", f"{len(st.session_state.cart)} / {n_bets}", f"${t_stake:.0f}")
-    
-    st.divider()
-    app_mode = st.radio("功能模式：", ["🎯 單場深度預測", "🛡️ 風險對沖實驗室", "🔧 參數校正實驗室", "📈 實戰績效回顧", "📚 劇本查詢"])
-    st.divider()
-    
-    # 購物車
-    with st.expander(f"🛒 待確認注單 ({len(st.session_state.cart)})", expanded=False):
-        if st.session_state.cart:
-            for i, bet in enumerate(st.session_state.cart):
-                st.write(f"{i+1}. {bet['sel']} @ {bet['odds']} (${bet['stake']})")
-            if st.button("✅ 一鍵下注"):
-                for bet in st.session_state.cart: ptrader.add_bet(bet['sel'], bet['odds'], bet['stake'])
-                st.session_state.cart = []
-                st.success("下注成功！")
-                st.rerun()
-            if st.button("🗑️ 清空"):
-                st.session_state.cart = []
-                st.rerun()
-        else: st.info("暫無注單")
-
-    with st.expander("🛠️ 進階參數", expanded=False):
-        unit_stake = st.number_input("單注本金", 10, 10000, 100)
-        nb_alpha = st.slider("Alpha", 0.05, 0.25, 0.12)
-        use_biv = st.toggle("雙變量", True)
-        use_dc = st.toggle("Dixon-Coles", True)
-        lam3_in = st.number_input("Lambda 3", 0.0, 0.5, 0.15)
-        rho_in = st.number_input("Rho", -0.3, 0.3, -0.13)
-        ha_in = st.number_input("Home Adv", 0.8, 1.6, 1.15)
-        risk_scale = st.slider("Kelly 係數", 0.1, 1.0, 0.3)
-        show_unc = st.toggle("顯示區間", True)
-
-if app_mode == "🎯 單場深度預測":
-    st.header("🎯 單場深度預測 (V41)")
-    if "analysis_results" not in st.session_state: st.session_state.analysis_results = None
-    
-    t1, t2 = st.tabs(["📋 貼上 JSON", "📂 上傳 JSON"])
-    inp = None
-    with t1:
-        txt = st.text_area("JSON Input", height=100)
-        if txt: 
-            try: inp = json.loads(txt)
-            except: st.error("Error")
-    with t2:
-        f = st.file_uploader("JSON File", type=['json'])
-        if f: inp = json.load(f)
-
-    if st.button("🚀 執行分析", type="primary") and inp:
-        eng = SniperAnalystLogic(inp, 9, nb_alpha, lam3_in, rho_in, ha_in)
-        lh, la, w = eng.calc_lambda()
-        M, probs = eng.build_matrix_v38(lh, la, use_biv, use_dc)
-        bonus = eng.get_market_trend_bonus()
-        odds = eng.market["1x2_odds"]
-        rid = eng.memory.analyze_scenario(lh, la, odds)
-        h_dat = eng.memory.recall_experience(rid)
-        sens_lv, sens_dr = eng.check_sensitivity(lh, la)
-        diff_p = abs(probs["hybrid"]["home"] - probs["market"]["home"])
-        conf, reasons = eng.calc_model_confidence(lh, la, diff_p, sens_dr)
-        hw, dr, aw, sh, sa = eng.run_monte_carlo_vectorized(M)
+# --- 登入/註冊頁面 (Gatekeeper) ---
+if not st.session_state.logged_in:
+    c1, c2, c3 = st.columns([1, 2, 1])
+    with c2:
+        st.title("🔐 Sniper V42.0 戰情室")
+        tab_login, tab_reg = st.tabs(["登入", "註冊新帳號"])
         
-        st.session_state.analysis_results = {
-            "eng": eng, "M": M, "lh": lh, "la": la, "w": w,
-            "probs": probs, "bonus": bonus, "h_dat": h_dat, "pen": 1.0,
-            "conf": conf, "reasons": reasons, "sh": sh, "sa": sa
-        }
-
-    if st.session_state.analysis_results:
-        res = st.session_state.analysis_results
-        eng, M, probs = res["eng"], res["M"], res["probs"]
-        
-        st.markdown("### 🔍 戰術儀表板")
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("主隊預期", f"{res['lh']:.2f}")
-        c2.metric("客隊預期", f"{res['la']:.2f}")
-        c3.metric("模型主勝", f"{probs['hybrid']['home']:.1%}")
-        c4.metric("信心", f"{res['conf']:.0%}")
-
-        t_val, t_ai, t_vis, t_sim, t_sand = st.tabs(["💰 價值投資", "🧠 智能裁決", "🌈 視覺洞察", "🎲 極速模擬", "🔮 終極沙盤推演"])
-        
-        candidates = []
-        with t_val:
-            st.subheader("獨贏 (1x2)")
-            r_1x2 = []
-            for tag, k in [("主勝","home"),("和局","draw"),("客勝","away")]:
-                p = probs["hybrid"][k]
-                o = eng.market["1x2_odds"][k]
-                raw_ev = (p*o - 1)*100 + res["bonus"][k]
-                adj_ev = raw_ev * res["conf"]
-                var, sharpe = calc_risk_metrics(p, o)
-                kelly = calc_risk_adj_kelly(adj_ev, var, risk_scale, p)
-                amt = unit_stake * (kelly/100.0)
-                r_1x2.append({"選項": tag, "賠率": o, "機率": f"{p:.1%}", "期望值": f"{adj_ev:.1f}%", "凱利建議": f"{kelly:.1f}%", "建議金額": f"${amt:.0f}"})
-                if adj_ev > 0.2: 
-                    candidates.append({"pick": tag, "odds": o, "ev": adj_ev, "kelly": kelly, "type": "1x2", "prob": p, "sharpe": sharpe})
-            st.dataframe(pd.DataFrame(r_1x2), use_container_width=True)
-            
-            # [V41.0] 亞盤 & 大小球 顯示優化
-            c_ah, c_ou = st.columns(2)
-            with c_ah:
-                st.subheader("亞盤 (AH)")
-                rows_ah = []
-                target = eng.market.get("target_odds", 1.90)
-                for hcap in eng.market.get("handicaps", [-0.5, 0.5]):
-                    raw = eng.ah_ev(M, hcap, target) + res["bonus"]["home"]
-                    adj = raw * res["conf"]
-                    p_approx = (raw/100+1)/target
-                    var, sharpe = calc_risk_metrics(p_approx, target)
-                    kel = calc_risk_adj_kelly(adj, var, risk_scale, p_approx)
-                    amt = unit_stake * (kel/100.0)
-                    
-                    if hcap < 0: tag_str = f"主讓 {hcap}"
-                    elif hcap > 0: tag_str = f"主受 +{hcap}"
-                    else: tag_str = "平手盤"
-                    
-                    rows_ah.append({"盤口": tag_str, "機率": f"{p_approx:.1%}", "期望值": f"{adj:.1f}%", "凱利": f"{kel:.1f}%", "金額": f"${amt:.0f}"})
-                    if adj > 0.5: candidates.append({"pick": tag_str, "odds": target, "ev": adj, "kelly": kel, "type": "AH", "prob": p_approx, "sharpe": sharpe})
-                st.dataframe(pd.DataFrame(rows_ah), use_container_width=True)
-            
-            with c_ou:
-                st.subheader("大小 (OU)")
-                rows_ou = []
-                idx_sum = np.add.outer(np.arange(eng.max_g), np.arange(eng.max_g))
-                for line in eng.market.get("goal_lines", [2.5]):
-                    p_over = float(M[idx_sum > line].sum())
-                    raw = (p_over*target - 1)*100
-                    adj = raw * res["conf"]
-                    var, sharpe = calc_risk_metrics(p_over, target)
-                    kel = calc_risk_adj_kelly(adj, var, risk_scale, p_over)
-                    amt = unit_stake * (kel/100.0)
-                    rows_ou.append({"盤口": f"大 {line}", "機率": f"{p_over:.1%}", "期望值": f"{adj:.1f}%", "凱利": f"{kel:.1f}%", "金額": f"${amt:.0f}"})
-                    if adj > 0.5: candidates.append({"pick":f"大 {line}", "odds":target, "ev":adj, "kelly":kel, "type":"OU", "prob": p_over, "sharpe": sharpe})
-                st.dataframe(pd.DataFrame(rows_ou), use_container_width=True)
-                
-            st.divider()
-            st.markdown("### 🏆 智能投資組合")
-            if candidates:
-                best = sorted(candidates, key=lambda x: x['ev'], reverse=True)
-                reco = []
-                for p in best:
-                    amt = unit_stake * (p['kelly']/100)
-                    reco.append({"選項": f"[{p['type']}] {p['pick']}", "賠率": p['odds'], "期望值": f"{p['ev']:+.1f}%", "凱利%": f"{p['kelly']:.1f}%", "建議$": f"${amt:.1f}"})
-                st.dataframe(pd.DataFrame(reco), use_container_width=True)
-                
-                c_cart1, c_cart2 = st.columns([3, 1])
-                bet_pick = c_cart1.selectbox("加入購物車", [f"[{p['type']}] {p['pick']}" for p in best])
-                if c_cart2.button("➕"):
-                    sel = next(p for p in best if f"[{p['type']}] {p['pick']}" == bet_pick)
-                    amt = unit_stake * (sel['kelly']/100)
-                    st.session_state.cart.append({"sel": bet_pick, "odds": sel['odds'], "stake": amt})
-                    st.success("已加入")
+        with tab_login:
+            u = st.text_input("帳號", key="l_u")
+            p = st.text_input("密碼", type="password", key="l_p")
+            if st.button("登入"):
+                success, is_admin = auth.login(u, p)
+                if success:
+                    st.session_state.logged_in = True
+                    st.session_state.username = u
+                    st.session_state.is_admin = is_admin
                     st.rerun()
-            else: st.info("無推薦注單")
-
-        with t_ai:
-            st.write("權重分析")
-            st.dataframe(pd.DataFrame([probs["model"], probs["market"], probs["hybrid"]], index=["純模型","市場隱含","混合權重"]))
-
-        with t_vis:
-            st.subheader("🌈 視覺洞察")
-            if HAS_PLOTLY:
-                st.plotly_chart(plot_radar_chart(res['lh'], res['la']), use_container_width=True)
-                st.divider()
-                c_v1, c_v2 = st.columns(2)
-                with c_v1: st.plotly_chart(plot_score_heatmap(M), use_container_width=True)
-                with c_v2: st.plotly_chart(px.histogram(x=res["sh"], nbins=10, title="主隊進球"), use_container_width=True)
-                st.plotly_chart(plot_sensitivity_surface(res['lh'], res['la'], lam3_in, rho_in, 9), use_container_width=True)
-            else: st.warning("請安裝 Plotly")
-
-        with t_sim:
-            hw = np.sum(res["sh"] > res["sa"]) / 500000
-            st.metric("MC 主勝", f"{hw:.1%}")
-            
-            # [V41.0] 極速模擬直方圖回歸
-            fig, ax = plt.subplots(figsize=(6,2))
-            ax.hist(res["sh"], alpha=0.5, label="Home", bins=range(8), density=True)
-            ax.hist(res["sa"], alpha=0.5, label="Away", bins=range(8), density=True)
-            ax.legend()
-            st.pyplot(fig)
-            
-            ce_res = eng.run_ce_importance_sampling(M, 4.5)
-            st.metric("大 4.5 機率", f"{ce_res['est']:.2%}")
-
-        with t_sand:
-            st.subheader("🔮 全域沙盤推演")
-            st.info("調整參數，即時預覽變化。")
-            sc1, sc2, sc3 = st.columns(3)
-            mod_ah = sc1.slider("主隊進攻", 0.5, 1.5, 1.0, 0.05)
-            mod_da = sc1.slider("客隊防守", 0.5, 1.5, 1.0, 0.05)
-            mod_aa = sc2.slider("客隊進攻", 0.5, 1.5, 1.0, 0.05)
-            mod_dh = sc2.slider("主隊防守", 0.5, 1.5, 1.0, 0.05)
-            luck = sc3.slider("運氣偏差", 0.8, 1.2, 1.0, 0.05)
-            red = sc3.checkbox("主隊紅牌")
-            
-            lh_n = res['lh'] * mod_ah * mod_da * luck
-            la_n = res['la'] * mod_aa * mod_dh * luck
-            if red: lh_n *= 0.4; la_n *= 1.3
-            
-            st.write(f"調整後: 主 {lh_n:.2f} | 客 {la_n:.2f}")
-            M_n, _ = eng.build_matrix_v38(lh_n, la_n, use_biv, use_dc)
-            ph_n = float(np.sum(np.tril(M_n,-1)))
-            
-            c_r1, c_r2 = st.columns(2)
-            c_r1.metric("新主勝率", f"{ph_n:.1%}")
-            o_h = eng.market["1x2_odds"]["home"]
-            nev = (ph_n*o_h-1)*100
-            c_r2.metric("新 EV", f"{nev:.1f}%", delta_color="normal" if nev>0 else "inverse")
-
-elif app_mode == "🛡️ 風險對沖實驗室":
-    st.title("🛡️ 風險對沖實驗室")
-    # [V41.1] 恢復完整功能與中文化 + 智能評語
-    tab_arb, tab_lay, tab_port = st.tabs(["⚡ 1x2 套利", "📉 交易所對沖", "📊 智能組合優化"])
-    
-    with tab_arb:
-        c1, c2, c3 = st.columns(3)
-        o1 = c1.number_input("主勝賠率", 2.0); o2 = c2.number_input("和局賠率", 3.0); o3 = c3.number_input("客勝賠率", 4.0)
-        inv = 1/o1+1/o2+1/o3
-        if inv<1: st.success(f"發現套利機會! ROI: {1/inv-1:.1%}")
-        else: st.info(f"無套利空間 (Book: {inv:.2%})")
-
-    with tab_lay:
-        c1, c2 = st.columns(2)
-        b_o = c1.number_input("Back 賠率", 1.01, 10.0, 2.5)
-        stake = c1.number_input("Back 本金", 10, 1000, 100)
-        l_o = c2.number_input("Lay 賠率", 1.01, 10.0, 2.6)
-        comm = c2.number_input("佣金 %", 0.0, 5.0, 2.0)/100
-        if l_o>1:
-            lay_s = (stake*b_o)/(l_o-comm)
-            st.metric("建議 Lay 金額", f"${lay_s:.2f}")
-
-    with tab_port:
-        if st.session_state.get("analysis_results"):
-            res = st.session_state.analysis_results
-            sh, sa = res["sh"], res["sa"]
-            eng = res["eng"]
-            if st.button("⚡ 計算最佳配置"):
-                cands = [{"name":"主勝","odds":eng.market["1x2_odds"]["home"],"cond":sh>sa}, {"name":"和局","odds":eng.market["1x2_odds"]["draw"],"cond":sh==sa}, {"name":"大2.5","odds":1.9,"cond":(sh+sa)>2.5}]
-                pay = np.zeros((500000,3))
-                for i,c in enumerate(cands): pay[:,i] = np.where(c["cond"], c["odds"]-1, -1)
-                mu, sigma = pay.mean(axis=0), np.cov(pay, rowvar=False)
-                cons = ({'type':'eq','fun':lambda w: sum(w)-1})
-                opt = minimize(lambda w: -(np.dot(w,mu)-np.dot(w.T,np.dot(sigma,w))), [0.33]*3, bounds=[(0,1)]*3, constraints=cons)
-                
-                weights = opt.x
-                cols = st.columns(len(cands))
-                active_bets = []
-                for i, w in enumerate(weights):
-                    cols[i].metric(cands[i]["name"], f"{w:.1%}", delta=f"EV: {mu[i]*100:.1f}%")
-                    if w > 0.05: active_bets.append(cands[i]["name"])
-                
-                # [V41.1] 智能評語
-                ret = np.dot(weights, mu)*100
-                max_w = max(weights)
-                
-                v_color = "blue"
-                v_text = ""
-                if not active_bets or ret < 0.2:
-                    v_color = "red"
-                    v_text = "⛔ 觀望建議：風險回報過低。"
-                elif max_w > 0.7:
-                    v_color = "green"
-                    v_text = f"🔥 強力單注：模型看好 **{active_bets[0]}**。"
-                elif len(active_bets) >= 2:
-                    v_color = "orange"
-                    v_text = f"⚖️ 結構化對沖：建議組合 **{' + '.join(active_bets)}**。"
                 else:
-                    v_color = "blue"
-                    v_text = "🔵 一般價值：小注怡情。"
-
-                st.markdown(f"""<div style='background:#f0f2f6;padding:15px;color:#333333;border-left:5px solid {v_color};border-radius:5px;'>
-                <h4 style="margin:0;color:{v_color}">👨‍🏫 首席分析師評語</h4>
-                <p style="margin-top:10px;">{v_text}</p>
-                <small>組合預期回報 (Portfolio EV): <b>{ret:.2f}%</b></small>
-                </div>""", unsafe_allow_html=True)
-        else: st.warning("請先執行單場預測")
-
-elif app_mode == "🔧 參數校正實驗室":
-    st.header("🔧 參數校正")
-    files = st.file_uploader("上傳 CSV/Excel", type=['csv','xlsx'], accept_multiple_files=True)
-    if files:
-        dfs = [preprocess_uploaded_data(pd.read_csv(f) if f.name.endswith('.csv') else pd.read_excel(f)) for f in files]
-        full = pd.concat([d for d in dfs if not d.empty])
-        if st.button("⚡ MLE"):
-            r = fit_params_mle(full)
-            if r["success"]: st.success(f"Lam3={r['lam3']:.2f}, Rho={r['rho']:.2f}, HA={r['home_adv']:.2f}")
-
-# [MODE 4: 實戰績效回顧 (Fixed Crash)]
-elif app_mode == "📈 實戰績效回顧":
-    st.title("📈 實戰績效回顧")
-    df = ptrader.load_bets()
-    
-    if not df.empty:
-        st.markdown("### 📝 注單管理 (直接點擊表格修改)")
-        # [V41.0 Fix] Corrected SelectboxColumn
-        edited_df = st.data_editor(
-            df,
-            column_config={
-                "Result": st.column_config.SelectboxColumn(
-                    "比賽結果",
-                    width="medium",
-                    options=["Pending", "Win", "Lose", "Void"],
-                    required=True,
-                ),
-                "PnL": st.column_config.NumberColumn(
-                    "損益 (PnL)",
-                    format="$%.1f",
-                    disabled=True 
-                )
-            },
-            num_rows="dynamic",
-            use_container_width=True
-        )
+                    st.error("帳號或密碼錯誤")
         
-        if st.button("💾 保存變更 & 結算損益"):
-            ptrader.save_bets(edited_df)
-            st.success("已更新損益狀態！")
-            st.rerun()
-            
-        st.divider()
-        if HAS_PLOTLY and "PnL" in df.columns:
-            st.subheader("💰 資金成長曲線")
-            df["CumPnL"] = df["PnL"].cumsum()
-            st.plotly_chart(px.line(df, x="Date", y="CumPnL", markers=True), use_container_width=True)
-            st.subheader("📅 獲利日曆")
-            st.plotly_chart(plot_calendar_heatmap(df), use_container_width=True)
-    else:
-        st.info("尚無模擬注單。請在「單場深度預測」中加入注單。")
+        with tab_reg:
+            nu = st.text_input("設定帳號", key="r_u")
+            np1 = st.text_input("設定密碼", type="password", key="r_p1")
+            np2 = st.text_input("確認密碼", type="password", key="r_p2")
+            if st.button("註冊"):
+                if np1 != np2:
+                    st.error("兩次密碼不符")
+                elif len(nu) < 3:
+                    st.error("帳號太短")
+                else:
+                    success, msg = auth.register(nu, np1)
+                    if success: st.success(msg)
+                    else: st.error(msg)
 
-elif app_mode == "📚 劇本查詢":
-    st.dataframe(pd.DataFrame([{"Name":v["name"],"ROI":v["roi"]} for k,v in RegimeMemory().history_db.items()]))
+# --- 主程式 (Logged In) ---
+else:
+    # 初始化該用戶的交易系統 (SQL)
+    ptrader = PaperTradingSystemSQL(st.session_state.username)
+    if "cart" not in st.session_state: st.session_state.cart = []
+
+    with st.sidebar:
+        st.title(f"👮‍♂️ {st.session_state.username}")
+        if st.session_state.is_admin:
+            st.success("👑 管理員權限已啟用")
+        
+        if st.button("🚪 登出"):
+            st.session_state.logged_in = False
+            st.session_state.username = None
+            st.session_state.is_admin = 0
+            st.rerun()
+        
+        st.divider()
+        n_bets, t_stake, t_pnl = ptrader.get_stats()
+        st.markdown("### 🏎️ 戰情室")
+        c1, c2 = st.columns(2)
+        c1.metric("本金", "$10,000")
+        c2.metric("損益", f"${t_pnl:.1f}", delta=f"{t_pnl/100:.1f}%")
+        st.metric("今日", f"{len(st.session_state.cart)} / {n_bets}", f"${t_stake:.0f}")
+        
+        st.divider()
+        
+        # 動態調整選單：管理員多一個「用戶管理」
+        menu_options = ["🎯 單場深度預測", "🛡️ 風險對沖實驗室", "🔧 參數校正實驗室", "📈 實戰績效回顧", "📚 劇本查詢"]
+        if st.session_state.is_admin:
+            menu_options.append("👑 用戶管理 (Admin)")
+            
+        app_mode = st.radio("模式", menu_options)
+        
+        with st.expander(f"🛒 購物車 ({len(st.session_state.cart)})"):
+            if st.session_state.cart:
+                for i, b in enumerate(st.session_state.cart): st.write(f"{i+1}. {b['sel']} @ {b['odds']} (${b['stake']:.0f})")
+                if st.button("✅ 下注"):
+                    for b in st.session_state.cart: ptrader.add_bet(b['sel'], b['odds'], b['stake'])
+                    st.session_state.cart = []
+                    st.success("OK")
+                    st.rerun()
+                if st.button("🗑️ 清空"):
+                    st.session_state.cart = []
+                    st.rerun()
+            else: st.info("空")
+
+        with st.expander("🛠️ 參數"):
+            unit_stake = st.number_input("單注", 10, 10000, 100)
+            nb_alpha = st.slider("Alpha", 0.05, 0.25, 0.12)
+            use_biv = st.toggle("雙變量", True)
+            use_dc = st.toggle("DC修正", True)
+            lam3_in = st.number_input("Lam3", 0.0, 0.5, 0.15)
+            rho_in = st.number_input("Rho", -0.3, 0.3, -0.13)
+            ha_in = st.number_input("主場優勢", 0.8, 1.6, 1.15)
+            risk_scale = st.slider("Kelly", 0.1, 1.0, 0.3)
+
+    if app_mode == "🎯 單場深度預測":
+        st.header("🎯 單場深度預測 (V42 SQL)")
+        t1, t2 = st.tabs(["JSON 文字", "JSON 檔案"])
+        inp = None
+        with t1:
+            txt = st.text_area("Input JSON", height=100)
+            if txt: 
+                try: inp = json.loads(txt)
+                except: st.error("Error")
+        with t2:
+            f = st.file_uploader("Upload JSON", type=['json'])
+            if f: inp = json.load(f)
+
+        if st.button("🚀 分析") and inp:
+            eng = SniperAnalystLogic(inp, 9, nb_alpha, lam3_in, rho_in, ha_in)
+            lh, la, w = eng.calc_lambda()
+            M, probs = eng.build_matrix_v38(lh, la, use_biv, use_dc)
+            conf, reasons = eng.calc_model_confidence(lh, la, 0.1, 0.0)
+            hw, dr, aw, sh, sa = eng.run_monte_carlo_vectorized(M)
+            st.session_state.res = {"eng": eng, "M": M, "lh": lh, "la": la, "probs": probs, "conf": conf, "sh": sh, "sa": sa}
+
+        if "res" in st.session_state and st.session_state.res:
+            res = st.session_state.res
+            eng, M = res["eng"], res["M"]
+            st.markdown("### 📊 儀表板")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("主預期", f"{res['lh']:.2f}")
+            c2.metric("客預期", f"{res['la']:.2f}")
+            c3.metric("信心", f"{res['conf']:.0%}")
+            
+            t_v, t_a, t_vis, t_sim, t_sand = st.tabs(["💰 價值", "🧠 智能", "🌈 視覺", "🎲 模擬", "🔮 沙盤"])
+            
+            best_bets = []
+            with t_v:
+                # 1x2 Table
+                r1x2 = []
+                for t, k in [("主勝","home"),("和","draw"),("客勝","away")]:
+                    p = res["probs"]["hybrid"][k]
+                    o = eng.market["1x2_odds"][k]
+                    ev = (p*o-1)*100
+                    kel = calc_risk_adj_kelly(ev, p*(o-1)**2 - (ev/100)**2, risk_scale, p)
+                    r1x2.append({"選項":t, "賠率":o, "EV":f"{ev:.1f}%", "Kelly":f"{kel:.1f}%"})
+                    if ev > 0.5: best_bets.append({"sel":t, "odds":o, "stake": unit_stake*kel/100})
+                st.dataframe(pd.DataFrame(r1x2))
+                
+                # AH Table
+                rah = []
+                for hcap in [-0.5, 0.5]:
+                    ev = eng.ah_ev(M, hcap, 1.9)
+                    rah.append({"盤口":hcap, "EV":f"{ev:.1f}%"})
+                st.dataframe(pd.DataFrame(rah))
+                
+                # Add to Cart
+                if best_bets:
+                    s_bet = st.selectbox("加入購物車", [f"{b['sel']} @ {b['odds']}" for b in best_bets])
+                    if st.button("➕"):
+                        sel = next(b for b in best_bets if f"{b['sel']} @ {b['odds']}" == s_bet)
+                        st.session_state.cart.append(sel)
+                        st.success("已加入")
+                        st.rerun()
+
+            with t_vis:
+                if HAS_PLOTLY:
+                    st.plotly_chart(plot_radar_chart(res['lh'], res['la']))
+                    st.plotly_chart(plot_score_heatmap(M))
+                else: st.warning("No Plotly")
+
+            with t_sand:
+                st.subheader("🔮 沙盤推演")
+                mod = st.slider("主隊進攻調整", 0.5, 1.5, 1.0)
+                nlh = res['lh'] * mod
+                st.metric("新主勝預期", f"{nlh:.2f}")
+
+    elif app_mode == "📈 實戰績效回顧":
+        st.title("📈 績效回顧")
+        df = ptrader.load_bets()
+        if not df.empty:
+            edited = st.data_editor(
+                df, 
+                num_rows="dynamic", 
+                key="editor",
+                column_config={
+                    "Result": st.column_config.SelectboxColumn(
+                        "比賽結果",
+                        options=["Pending", "Win", "Lose", "Void"],
+                        required=True
+                    )
+                }
+            )
+            if st.button("💾 更新損益"):
+                ptrader.save_bets(edited) 
+                st.success("Updated")
+                st.rerun()
+            if HAS_PLOTLY and "pnl" in df.columns:
+                df["CumPnL"] = df["pnl"].cumsum()
+                st.plotly_chart(px.line(df, x="date", y="CumPnL"))
+        else: st.info("無數據")
+
+    elif app_mode == "🔧 參數校正實驗室":
+        st.header("🔧 參數校正")
+        files = st.file_uploader("CSV", accept_multiple_files=True)
+        if files:
+            dfs = [preprocess_uploaded_data(pd.read_csv(f)) for f in files]
+            full = pd.concat([d for d in dfs if not d.empty])
+            if st.button("⚡ MLE"):
+                r = fit_params_mle(full)
+                if r["success"]: st.success(f"Lam3={r['lam3']:.2f}")
+
+    elif app_mode == "🛡️ 風險對沖實驗室":
+        st.title("🛡️ 風險對沖實驗室")
+        tab_arb, tab_lay, tab_port = st.tabs(["⚡ 1x2 套利", "📉 交易所對沖", "📊 智能組合優化"])
+        
+        with tab_arb:
+            st.subheader("無風險套利計算 (Arbitrage)")
+            c1, c2, c3 = st.columns(3)
+            o1 = c1.number_input("主勝賠率", 2.0); o2 = c2.number_input("和局賠率", 3.0); o3 = c3.number_input("客勝賠率", 4.0)
+            inv = 1/o1+1/o2+1/o3
+            if inv<1: st.success(f"發現套利機會! ROI: {1/inv-1:.1%}")
+            else: st.info(f"無套利空間 (Book: {inv:.2%})")
+
+        with tab_lay:
+            st.subheader("交易所對沖計算器 (Back-Lay)")
+            c1, c2 = st.columns(2)
+            b_o = c1.number_input("Back 賠率", 1.01, 10.0, 2.5)
+            stake = c1.number_input("Back 本金", 10, 1000, 100)
+            l_o = c2.number_input("Lay 賠率", 1.01, 10.0, 2.6)
+            comm = c2.number_input("佣金 %", 0.0, 5.0, 2.0)/100
+            if l_o>1:
+                lay_s = (stake*b_o)/(l_o-comm)
+                st.metric("建議 Lay 金額", f"${lay_s:.2f}")
+
+        with tab_port:
+            st.subheader("智能組合優化 (Portfolio Optimization)")
+            if st.session_state.get("res"):
+                res = st.session_state.res
+                sh, sa = res["sh"], res["sa"]
+                eng = res["eng"]
+                if st.button("⚡ 計算最佳配置"):
+                    cands = [{"name":"主勝","odds":eng.market["1x2_odds"]["home"],"cond":sh>sa}, {"name":"和局","odds":eng.market["1x2_odds"]["draw"],"cond":sh==sa}, {"name":"大2.5","odds":1.9,"cond":(sh+sa)>2.5}]
+                    pay = np.zeros((500000,3))
+                    for i,c in enumerate(cands): pay[:,i] = np.where(c["cond"], c["odds"]-1, -1)
+                    mu, sigma = pay.mean(axis=0), np.cov(pay, rowvar=False)
+                    cons = ({'type':'eq','fun':lambda w: sum(w)-1})
+                    opt = minimize(lambda w: -(np.dot(w,mu)-np.dot(w.T,np.dot(sigma,w))), [0.33]*3, bounds=[(0,1)]*3, constraints=cons)
+                    for i,w in enumerate(opt.x): st.metric(cands[i]["name"], f"{w:.1%}")
+                    
+                    ret = np.dot(opt.x, mu)*100
+                    st.markdown(f"""<div style='background:#f0f2f6;padding:10px;color:black'>
+                    <b>首席分析師:</b> 預期回報 {ret:.2f}%。建議 {"分散配置以降低波動" if max(opt.x)<0.7 else "集中單打高價值選項"}。</div>""", unsafe_allow_html=True)
+            else: st.warning("請先執行單場預測")
+        
+    elif app_mode == "📚 劇本查詢":
+        st.dataframe(pd.DataFrame([{"N":v["name"]} for k,v in RegimeMemory().history_db.items()]))
+
+    # [V42.0] New Admin Panel
+    elif app_mode == "👑 用戶管理 (Admin)":
+        if not st.session_state.is_admin:
+            st.error("您沒有權限訪問此頁面")
+        else:
+            st.header("👑 用戶管理後台")
+            st.info("這裡是最高權限區，請謹慎操作")
+            
+            users_df = auth.get_all_users()
+            st.dataframe(users_df, use_container_width=True)
+            
+            with st.expander("🗑️ 刪除用戶"):
+                del_user = st.selectbox("選擇要刪除的用戶", users_df['username'])
+                if st.button("確認刪除 (含所有注單)", type="primary"):
+                    if del_user == 'admin':
+                        st.error("無法刪除超級管理員")
+                    elif auth.delete_user(del_user):
+                        st.success(f"已刪除用戶 {del_user} 及其所有數據")
+                        st.rerun()
+                    else:
+                        st.error("刪除失敗")
